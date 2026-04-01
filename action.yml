@@ -1,0 +1,566 @@
+name: "DigiCert Scan (CodeQL + SBOM)"
+description: "Runs CodeQL multi-language scan (languages auto from backend) and generates SBOM. Uploads artifacts for backend ingestion."
+author: "DigiCert"
+
+inputs:
+  env:
+    description: "Backend environment to use (prod|stage)"
+    required: false
+    default: "prod"
+
+  region:
+    description: "DC One region for authentication/routing (required)"
+    required: true
+
+  api-key:
+    description: "API key for DigiCert backend (pass via secrets)"
+    required: true
+  name:
+    description: "Repo-scoped scan name used to create/find a DC One external release and dedupe scans by (name + branch + commitSha). If with-release is true, this must be provided."
+    required: false
+
+  with-release:
+    description: "When true, require name and tag and build the scan name as '<name>-<tag>' so runs align with a specific release tag."
+    required: false
+    default: "false"
+
+  tag:
+    description: "Release tag used only when with-release is true (required when with-release is true)."
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve backend base URL
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        case "${{ inputs.env }}" in
+          prod)
+            echo "BACKEND_BASE_URL=https://releasemonitor.digicert.com" >> "$GITHUB_ENV"
+            ;;
+          stage)
+            echo "BACKEND_BASE_URL=https://releasemonitor.stage.az.digicert.net" >> "$GITHUB_ENV"
+            ;;
+          *)
+            echo "Unsupported env: '${{ inputs.env }}' (use prod|stage)" >&2
+            exit 1
+            ;;
+        esac
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Resolve repo context (owner/repo/ref)
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -z "${GITHUB_REPOSITORY_OWNER:-}" ] || [ -z "${GITHUB_REPOSITORY:-}" ]; then
+          echo "Missing GitHub repository context (GITHUB_REPOSITORY_OWNER/GITHUB_REPOSITORY)." >&2
+          exit 1
+        fi
+
+        # GITHUB_REPOSITORY = owner/repo
+        DC_OWNER="${GITHUB_REPOSITORY_OWNER}"
+        DC_REPO="${GITHUB_REPOSITORY#*/}"
+        DC_REF="${GITHUB_REF:-}"
+
+        if [ -z "$DC_REPO" ] || [ "$DC_REPO" = "$GITHUB_REPOSITORY" ]; then
+          echo "Could not parse repo name from GITHUB_REPOSITORY=$GITHUB_REPOSITORY" >&2
+          exit 1
+        fi
+
+        echo "DC_OWNER=$DC_OWNER" >> "$GITHUB_ENV"
+        echo "DC_REPO=$DC_REPO" >> "$GITHUB_ENV"
+        echo "DC_REF=$DC_REF" >> "$GITHUB_ENV"
+
+        # Action constants (avoid additional inputs).
+        echo "DC_CODEQL_BUILD_MODE=none" >> "$GITHUB_ENV"
+        echo "DC_SARIF_OUTPUT=codeql.sarif" >> "$GITHUB_ENV"
+        echo "DC_SARIF_ARTIFACT_NAME=digicert_scan_results" >> "$GITHUB_ENV"
+        echo "DC_SBOM_OUTPUT=sbom.cyclonedx.json" >> "$GITHUB_ENV"
+        echo "DC_SBOM_ARTIFACT_NAME=sbom-cyclonedx" >> "$GITHUB_ENV"
+
+        # Default: run the scan unless backend prepare says otherwise.
+        echo "DC_SHOULD_RUN=true" >> "$GITHUB_ENV"
+
+    - name: Prepare Code Analysis Scan (name)
+      id: cas_prepare
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        WITH_RELEASE_RAW="${{ inputs.with-release }}"
+        WITH_RELEASE="$(echo "${WITH_RELEASE_RAW:-false}" | tr '[:upper:]' '[:lower:]' | xargs)"
+        if [ -z "$WITH_RELEASE" ]; then
+          WITH_RELEASE="false"
+        fi
+
+        case "$WITH_RELEASE" in
+          true|false)
+            ;;
+          *)
+            echo "Invalid with-release input: '$WITH_RELEASE_RAW' (use true|false)" >&2
+            exit 1
+            ;;
+        esac
+
+        if [ "$WITH_RELEASE" = "true" ]; then
+          WITH_RELEASE_JSON=true
+        else
+          WITH_RELEASE_JSON=false
+        fi
+
+        NAME_RAW="${{ inputs.name }}"
+        TAG_RAW="${{ inputs.tag }}"
+        TAG="$(echo "${TAG_RAW:-}" | xargs || true)"
+
+        if [ "$WITH_RELEASE" = "true" ]; then
+          if [ -z "$NAME_RAW" ] || [ "$NAME_RAW" = "null" ]; then
+            echo "Input 'name' is required when with-release is true." >&2
+            exit 1
+          fi
+          if [ -z "$TAG_RAW" ] || [ "$TAG_RAW" = "null" ]; then
+            echo "Input 'tag' is required when with-release is true." >&2
+            exit 1
+          fi
+          SCAN_NAME_RAW="${NAME_RAW}-${TAG_RAW}"
+        else
+          SCAN_NAME_RAW="$NAME_RAW"
+          if [ -z "$SCAN_NAME_RAW" ] || [ "$SCAN_NAME_RAW" = "null" ]; then
+            WF="${GITHUB_WORKFLOW:-code-analysis-scan}"
+            EVT="${GITHUB_EVENT_NAME:-manual}"
+            SCAN_NAME_RAW="${WF}-${EVT}"
+          fi
+        fi
+
+        SCAN_NAME="$SCAN_NAME_RAW"
+
+        SCAN_NAME="$(echo "$SCAN_NAME" | \
+          sed -E 's/[[:space:]]+/-/g; s#[/\\\\]+#-#g; s/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//' | \
+          cut -c1-100)"
+
+        if [ -z "$SCAN_NAME" ]; then
+          SCAN_NAME="code-analysis-${GITHUB_EVENT_NAME:-manual}"
+        fi
+
+        echo "DC_SCAN_NAME=$SCAN_NAME" >> "$GITHUB_ENV"
+
+        URL="${BACKEND_BASE_URL}/releasemonitor/api/v1/gha/code-analysis/scans/prepare"
+        echo "Preparing CAS at: $URL"
+
+        REPO_FULL_NAME="${GITHUB_REPOSITORY:-${DC_OWNER}/${DC_REPO}}"
+        REF_NAME="${GITHUB_REF_NAME:-}"
+
+        payload="$(jq -cn \
+          --arg scanName "$SCAN_NAME" \
+          --argjson withRelease "$WITH_RELEASE_JSON" \
+          --arg tag "$TAG" \
+          --arg repository "$REPO_FULL_NAME" \
+          --arg owner "${DC_OWNER}" \
+          --arg repo "${DC_REPO}" \
+          --arg ref "${GITHUB_REF:-${DC_REF}}" \
+          --arg refName "$REF_NAME" \
+          --arg sha "${GITHUB_SHA:-}" \
+          --arg runId "${GITHUB_RUN_ID:-}" \
+          --arg runAttempt "${GITHUB_RUN_ATTEMPT:-}" \
+          --arg workflow "${GITHUB_WORKFLOW:-}" \
+          --arg workflowRef "${GITHUB_WORKFLOW_REF:-}" \
+          --arg job "${GITHUB_JOB:-}" \
+          --arg eventName "${GITHUB_EVENT_NAME:-}" \
+          '{
+            scanName: $scanName,
+            withRelease: $withRelease,
+            tag: $tag,
+            github: {
+              repository: $repository,
+              owner: $owner,
+              repo: $repo,
+              ref: $ref,
+              refName: $refName,
+              sha: $sha,
+              eventName: $eventName,
+              workflow: $workflow,
+              workflowRef: $workflowRef,
+              job: $job,
+              runId: $runId,
+              runAttempt: $runAttempt
+            }
+          }')"
+
+        raw="$(curl -sS -X POST "$URL" \
+          -H "Content-Type: application/json" \
+          -H "X-API-KEY: ${{ inputs.api-key }}" \
+          -H "X-DCONE-REGION: ${{ inputs.region }}" \
+          --data-raw "$payload" \
+          -w $'\n%{http_code}')"
+
+        body="${raw%$'\n'*}"
+        status="${raw##*$'\n'}"
+
+        if [ -z "$status" ] || ! [[ "$status" =~ ^[0-9][0-9][0-9]$ ]]; then
+          echo "Failed to prepare CAS (no HTTP status). Response: $raw" >&2
+          exit 1
+        fi
+
+        if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+          echo "Failed to prepare CAS (HTTP $status). Response body: $body" >&2
+          exit 1
+        fi
+
+        CAS_ID="$(echo "$body" | jq -r '.id // empty')"
+        SHOULD_RUN="$(echo "$body" | jq -r 'if has("shouldRun") then (.shouldRun | tostring) else empty end')"
+
+        if [ -z "$CAS_ID" ]; then
+          echo "Backend did not return CAS id. Response body: $body" >&2
+          exit 1
+        fi
+
+        if [ -z "$SHOULD_RUN" ]; then
+          echo "Backend did not return shouldRun. Response body: $body" >&2
+          exit 1
+        fi
+
+        echo "DC_CAS_ID=$CAS_ID" >> "$GITHUB_ENV"
+        echo "DC_SHOULD_RUN=$SHOULD_RUN" >> "$GITHUB_ENV"
+
+        echo "id=$CAS_ID" >> "$GITHUB_OUTPUT"
+        echo "shouldRun=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+
+        if [ "$SHOULD_RUN" != "true" ]; then
+          echo "Scan already completed or in progress; skipping (shouldRun=$SHOULD_RUN)."
+        fi
+
+    - name: Resolve CodeQL languages
+      id: langs
+      shell: bash
+      if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      run: |
+        set -euo pipefail
+
+        URL="${BACKEND_BASE_URL}/releasemonitor/api/v1/gha/code-analysis/languages"
+        echo "Fetching languages from: $URL"
+
+        # Requires jq on runner (ubuntu has it)
+        # Capture body + status code to handle API errors gracefully.
+        if [ -n "${DC_REF}" ]; then
+          RAW="$(curl -sS -G "$URL" \
+            -H "X-API-KEY: ${{ inputs.api-key }}" \
+            -H "X-DCONE-REGION: ${{ inputs.region }}" \
+            --data-urlencode "repo=${DC_REPO}" \
+            --data-urlencode "ref=${DC_REF}" \
+            -w $'\n%{http_code}')"
+        else
+          RAW="$(curl -sS -G "$URL" \
+            -H "X-API-KEY: ${{ inputs.api-key }}" \
+            -H "X-DCONE-REGION: ${{ inputs.region }}" \
+            --data-urlencode "repo=${DC_REPO}" \
+            -w $'\n%{http_code}')"
+        fi
+
+        BODY="${RAW%$'\n'*}"
+        STATUS="${RAW##*$'\n'}"
+
+        if [ -z "$STATUS" ] || ! [[ "$STATUS" =~ ^[0-9][0-9][0-9]$ ]]; then
+          echo "Failed to call backend (no HTTP status). Response: $RAW" >&2
+          exit 1
+        fi
+
+        if [ "$STATUS" -lt 200 ] || [ "$STATUS" -ge 300 ]; then
+          ERR_MSG="$(echo "$BODY" | jq -r '.error.message? // .error? // .message? // empty' 2>/dev/null || true)"
+          if [ -z "$ERR_MSG" ]; then
+            ERR_MSG="Backend returned HTTP $STATUS"
+          fi
+          echo "Failed to fetch languages: $ERR_MSG" >&2
+          echo "Backend response body: $BODY" >&2
+          exit 1
+        fi
+
+        echo "Backend response: $BODY"
+
+        LANGS="$(echo "$BODY" | jq -e -r '.languages | select(type=="array") | join(",")' 2>/dev/null || true)"
+
+        if [ -z "$LANGS" ] || [ "$LANGS" = "null" ]; then
+          echo "No languages returned by backend." >&2
+          echo "Backend response body: $BODY" >&2
+          exit 1
+        fi
+
+        echo "LANGS=$LANGS" >> "$GITHUB_ENV"
+        echo "languages=$LANGS" >> "$GITHUB_OUTPUT"
+
+    - name: Initialize CodeQL
+      if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ steps.langs.outputs.languages }}
+        build-mode: ${{ env.DC_CODEQL_BUILD_MODE }}
+
+    - name: Perform CodeQL Analysis
+      if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      uses: github/codeql-action/analyze@v3
+      with:
+        upload: false
+        output: ${{ env.DC_SARIF_OUTPUT }}
+
+    - name: Upload SARIF result as artifact
+      if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      id: upload_sarif
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.DC_SARIF_ARTIFACT_NAME }}
+        path: ${{ env.DC_SARIF_OUTPUT }}
+
+    - name: Post SARIF to backend
+      if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        ARTIFACT_ID="${{ steps.upload_sarif.outputs.artifact-id }}"
+        ARTIFACT_NAME="${DC_SARIF_ARTIFACT_NAME}"
+
+        if [ -z "$ARTIFACT_ID" ]; then
+          echo "Missing artifact-id from upload-artifact step; cannot trigger backend SARIF processing." >&2
+          exit 1
+        fi
+
+        URL="${BACKEND_BASE_URL}/releasemonitor/api/v1/gha/code-analysis/sarif"
+
+        if [ -z "${DC_CAS_ID:-}" ]; then
+          echo "No DC_CAS_ID set; cannot correlate SARIF to a scan." >&2
+          exit 1
+        fi
+        CORRELATION_ID="$DC_CAS_ID"
+
+        REPO_FULL_NAME="${GITHUB_REPOSITORY:-${DC_OWNER}/${DC_REPO}}"
+        REF_NAME="${GITHUB_REF_NAME:-}"
+
+        # For best per-language behavior, run one job per language (matrix)
+        # and post each language's SARIF separately.
+        LANGS_RAW="${{ steps.langs.outputs.languages }}"
+        LANGS_CSV="$(echo "$LANGS_RAW" | tr -d ' ' || true)"
+        if [ -z "$LANGS_CSV" ]; then
+          LANGS_CSV="auto"
+        fi
+
+        payload="$(jq -cn \
+          --arg correlationId "$CORRELATION_ID" \
+          --arg artifactId "$ARTIFACT_ID" \
+          --arg artifactName "$ARTIFACT_NAME" \
+          --arg owner "${DC_OWNER}" \
+          --arg repo "${DC_REPO}" \
+          --arg repository "$REPO_FULL_NAME" \
+          --arg ref "${GITHUB_REF:-${DC_REF}}" \
+          --arg refName "$REF_NAME" \
+          --arg sha "${GITHUB_SHA:-}" \
+          --arg workflow "${GITHUB_WORKFLOW:-}" \
+          --arg workflowRef "${GITHUB_WORKFLOW_REF:-}" \
+          --arg job "${GITHUB_JOB:-}" \
+          --arg runId "${GITHUB_RUN_ID:-}" \
+          --arg runAttempt "${GITHUB_RUN_ATTEMPT:-}" \
+          --arg eventName "${GITHUB_EVENT_NAME:-}" \
+          --arg languages "$LANGS_CSV" \
+          '{
+            correlationId: $correlationId,
+            artifactId: $artifactId,
+            artifactName: $artifactName,
+            github: {
+              repository: $repository,
+              owner: $owner,
+              repo: $repo,
+              ref: $ref,
+              refName: $refName,
+              sha: $sha,
+              eventName: $eventName,
+              workflow: $workflow,
+              workflowRef: $workflowRef,
+              job: $job,
+              runId: $runId,
+              runAttempt: $runAttempt
+            },
+            codeql: {
+              languages: ($languages | split(",") | map(select(length > 0)))
+            },
+            sarifFileName: "artifact.zip"
+          }')"
+
+        echo "Triggering backend SARIF processing at: $URL (artifactId=$ARTIFACT_ID, artifactName=$ARTIFACT_NAME)"
+
+        raw="$(curl -sS -X POST "$URL" \
+          -H "Content-Type: application/json" \
+          -H "X-API-KEY: ${{ inputs.api-key }}" \
+          -H "X-DCONE-REGION: ${{ inputs.region }}" \
+          --data-raw "$payload" \
+          -w $'\n%{http_code}')"
+
+        body="${raw%$'\n'*}"
+        status="${raw##*$'\n'}"
+
+        if [ -z "$status" ] || ! [[ "$status" =~ ^[0-9][0-9][0-9]$ ]]; then
+          echo "Failed to trigger SARIF processing (no HTTP status). Response: $raw" >&2
+          exit 1
+        fi
+
+        if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+          echo "Failed to trigger SARIF processing (HTTP $status). Response body: $body" >&2
+          exit 1
+        fi
+
+        echo "Backend SARIF processing triggered successfully (HTTP $status)"
+
+    - name: Finalize CAS on backend
+      if: ${{ always() && env.DC_SHOULD_RUN == 'true' }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -z "${DC_CAS_ID:-}" ]; then
+          echo "No DC_CAS_ID set; skipping finalize."
+          exit 0
+        fi
+
+        JOB_STATUS="${{ job.status }}"
+        if [ "$JOB_STATUS" = "success" ]; then
+          FINAL_STATUS="COMPLETED"
+        else
+          FINAL_STATUS="FAILED"
+        fi
+
+        URL="${BACKEND_BASE_URL}/releasemonitor/api/v1/gha/code-analysis/scans/${DC_CAS_ID}/finalize"
+        echo "Finalizing CAS ${DC_CAS_ID} at: $URL (status=${FINAL_STATUS}, job.status=${JOB_STATUS})"
+
+        payload="$(jq -cn \
+          --arg status "$FINAL_STATUS" \
+          --arg message "Composite action finalized with job.status=${JOB_STATUS}" \
+          --arg failureStage "composite" \
+          '{ status: $status, message: $message, failureStage: $failureStage }')"
+
+        raw="$(curl -sS -X POST "$URL" \
+          -H "Content-Type: application/json" \
+          -H "X-API-KEY: ${{ inputs.api-key }}" \
+          -H "X-DCONE-REGION: ${{ inputs.region }}" \
+          --data-raw "$payload" \
+          -w $'\n%{http_code}')"
+
+        body="${raw%$'\n'*}"
+        status="${raw##*$'\n'}"
+
+        if [ -z "$status" ] || ! [[ "$status" =~ ^[0-9][0-9][0-9]$ ]]; then
+          echo "Finalize CAS failed (no HTTP status). Response: $raw" >&2
+          exit 0
+        fi
+
+        if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+          echo "Finalize CAS failed (HTTP $status). Response body: $body" >&2
+          exit 0
+        fi
+
+        echo "Finalize CAS succeeded (HTTP $status)"
+
+    - name: Generate SBOM (Trivy CycloneDX)
+      if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: "fs"
+        format: "cyclonedx"
+        output: ${{ env.DC_SBOM_OUTPUT }}
+
+    - name: Upload SBOM as artifact
+      if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      id: upload_sbom
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.DC_SBOM_ARTIFACT_NAME }}
+        path: ${{ env.DC_SBOM_OUTPUT }}
+
+    - name: Post SBOM to backend
+      if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -z "${DC_CAS_ID:-}" ]; then
+          echo "No DC_CAS_ID set; cannot correlate SBOM to a scan. Enable the prepare flow or ensure CAS creation runs." >&2
+          exit 1
+        fi
+
+        ARTIFACT_ID="${{ steps.upload_sbom.outputs.artifact-id }}"
+        ARTIFACT_NAME="${DC_SBOM_ARTIFACT_NAME}"
+
+        if [ -z "$ARTIFACT_ID" ]; then
+          echo "Missing artifact-id from upload-artifact step; cannot trigger backend SBOM processing." >&2
+          exit 1
+        fi
+
+        URL="${BACKEND_BASE_URL}/releasemonitor/api/v1/gha/code-analysis/sbom"
+
+        CORRELATION_ID="$DC_CAS_ID"
+
+        REPO_FULL_NAME="${GITHUB_REPOSITORY:-${DC_OWNER}/${DC_REPO}}"
+        REF_NAME="${GITHUB_REF_NAME:-}"
+
+        payload="$(jq -cn \
+          --arg correlationId "$CORRELATION_ID" \
+          --arg artifactId "$ARTIFACT_ID" \
+          --arg artifactName "$ARTIFACT_NAME" \
+          --arg sbomFileName "${DC_SBOM_ARTIFACT_NAME}" \
+          --arg owner "${DC_OWNER}" \
+          --arg repo "${DC_REPO}" \
+          --arg repository "$REPO_FULL_NAME" \
+          --arg ref "${GITHUB_REF:-${DC_REF}}" \
+          --arg refName "$REF_NAME" \
+          --arg sha "${GITHUB_SHA:-}" \
+          --arg workflow "${GITHUB_WORKFLOW:-}" \
+          --arg workflowRef "${GITHUB_WORKFLOW_REF:-}" \
+          --arg job "${GITHUB_JOB:-}" \
+          --arg runId "${GITHUB_RUN_ID:-}" \
+          --arg runAttempt "${GITHUB_RUN_ATTEMPT:-}" \
+          --arg eventName "${GITHUB_EVENT_NAME:-}" \
+          '{
+            correlationId: $correlationId,
+            artifactId: $artifactId,
+            artifactName: $artifactName,
+            sbomFileName: $sbomFileName,
+            github: {
+              repository: $repository,
+              owner: $owner,
+              repo: $repo,
+              ref: $ref,
+              refName: $refName,
+              sha: $sha,
+              eventName: $eventName,
+              workflow: $workflow,
+              workflowRef: $workflowRef,
+              job: $job,
+              runId: $runId,
+              runAttempt: $runAttempt
+            }
+          }')"
+
+        echo "Triggering backend SBOM processing at: $URL (artifactId=$ARTIFACT_ID, artifactName=$ARTIFACT_NAME, correlationId=$CORRELATION_ID)"
+
+        raw="$(curl -sS -X POST "$URL" \
+          -H "Content-Type: application/json" \
+          -H "X-API-KEY: ${{ inputs.api-key }}" \
+          -H "X-DCONE-REGION: ${{ inputs.region }}" \
+          --data-raw "$payload" \
+          -w $'\n%{http_code}')"
+
+        body="${raw%$'\n'*}"
+        status="${raw##*$'\n'}"
+
+        if [ -z "$status" ] || ! [[ "$status" =~ ^[0-9][0-9][0-9]$ ]]; then
+          echo "Failed to trigger SBOM processing (no HTTP status). Response: $raw" >&2
+          exit 1
+        fi
+
+        if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+          echo "Failed to trigger SBOM processing (HTTP $status). Response body: $body" >&2
+          exit 1
+        fi
+
+        echo "Backend SBOM processing triggered successfully (HTTP $status)"
