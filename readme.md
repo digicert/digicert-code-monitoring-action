@@ -89,8 +89,8 @@ Consumers should pin to a release tag or SHA for stability.
 
 ## Support And Contributions
 
-- To report bugs or request enhancements, open an issue in this repository with reproduction steps and expected behavior.
-- To submit changes, open a pull request with a clear description, linked issue (if applicable), and any relevant workflow logs.
+- Contribution guide: see [CONTRIBUTING.md](CONTRIBUTING.md)
+- For bug reports, feature requests, and pull requests, follow the process in [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Feedback and issues
 
