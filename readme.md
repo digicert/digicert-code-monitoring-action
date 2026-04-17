@@ -94,7 +94,7 @@ Consumers should pin to a release tag or SHA for stability.
 
 ## Feedback and issues
 
-For Technical Support or Sales, [contact DigiCert][digicert-sales-ref].
+For Technical Support or Sales, [contact DigiCert](https://www.digicert.com/contact-us).
 
 ## Security Notes
 
