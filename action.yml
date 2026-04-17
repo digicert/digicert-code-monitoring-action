@@ -50,7 +50,7 @@ runs:
         esac
 
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: Resolve repo context (owner/repo/ref)
       shell: bash
@@ -293,14 +293,14 @@ runs:
 
     - name: Initialize CodeQL
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
-      uses: github/codeql-action/init@v3
+      uses: github/codeql-action/init@v4
       with:
         languages: ${{ steps.langs.outputs.languages }}
         build-mode: ${{ env.DC_CODEQL_BUILD_MODE }}
 
     - name: Perform CodeQL Analysis
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
-      uses: github/codeql-action/analyze@v3
+      uses: github/codeql-action/analyze@v4
       with:
         upload: false
         output: ${{ env.DC_SARIF_OUTPUT }}
@@ -308,7 +308,7 @@ runs:
     - name: Upload SARIF result as artifact
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
       id: upload_sarif
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: ${{ env.DC_SARIF_ARTIFACT_NAME }}
         path: ${{ env.DC_SARIF_OUTPUT }}
@@ -463,7 +463,7 @@ runs:
 
     - name: Generate SBOM (Trivy CycloneDX)
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
-      uses: aquasecurity/trivy-action@master
+      uses: aquasecurity/trivy-action@v0.35.0
       with:
         scan-type: "fs"
         format: "cyclonedx"
@@ -472,7 +472,7 @@ runs:
     - name: Upload SBOM as artifact
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
       id: upload_sbom
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: ${{ env.DC_SBOM_ARTIFACT_NAME }}
         path: ${{ env.DC_SBOM_OUTPUT }}
