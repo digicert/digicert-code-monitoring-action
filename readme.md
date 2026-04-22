@@ -92,9 +92,16 @@ Consumers should pin to a release tag or SHA for stability.
 - Contribution guide: see [CONTRIBUTING.md](CONTRIBUTING.md)
 - For bug reports, feature requests, and pull requests, follow the process in [CONTRIBUTING.md](CONTRIBUTING.md)
 
-## Feedback and issues
+## Support
 
-For Technical Support or Sales, [contact DigiCert](https://www.digicert.com/contact-us).
+If you need help with setup, credentials, backend connectivity, or workflow troubleshooting, use DigiCert support channels:
+
+- Support Portal: https://www.digicert.com/support
+- Contact Us: https://www.digicert.com/contact-us
+
+These channels are staffed by DigiCert engineers who can assist with account-level and environment-specific questions.
+
+> **Note:** Support requests opened as GitHub issues in this repository may be redirected to DigiCert support channels.
 
 ## Security Notes
 

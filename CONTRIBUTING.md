@@ -5,21 +5,14 @@ Thank you for your interest in contributing to this project. This document expla
 ## Table of Contents
 
 - [Getting Help](#getting-help)
-- [Reporting Issues](#reporting-issues)
+- [Reporting Bugs](#reporting-bugs)
 - [Requesting Features](#requesting-features)
 - [Submitting Pull Requests](#submitting-pull-requests)
 - [Managing Security](#managing-security)
 
 ## Getting Help
 
-If you need help with setup, credentials, backend connectivity, or workflow troubleshooting, use DigiCert support channels:
-
-- Support Portal: https://www.digicert.com/support
-- Contact Us: https://www.digicert.com/contact-us
-
-These channels are staffed by DigiCert engineers who can assist with account-level and environment-specific questions.
-
-> **Note:** SSupport requests opened as GitHub issues in this repository may be redirected to DigiCert support channels.
+For support contact information, setup help, and troubleshooting resources, see the [Support section in README.md](README.md#support).
 
 ## Reporting Bugs
 
