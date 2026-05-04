@@ -1,4 +1,4 @@
-name: "DigiCert Scan (CodeQL + SBOM)"
+name: "DigiCert Code Monitoring Action"
 description: "Runs CodeQL multi-language scan (languages auto from backend) and generates SBOM. Uploads artifacts for backend ingestion."
 author: "DigiCert"
 

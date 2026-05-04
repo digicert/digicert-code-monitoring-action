@@ -1,4 +1,4 @@
-# DigiCert Code Scan GitHub Action
+# DigiCert Code Monitoring Action
 
 Standalone composite GitHub Action that runs:
 
@@ -6,7 +6,7 @@ Standalone composite GitHub Action that runs:
 - SBOM generation (CycloneDX via Trivy)
 - Artifact upload and backend ingestion callbacks
 
-This repository is intended to be published and versioned so other repositories can consume it using `uses: digicert/srm-github-action@<tag>`.
+This repository is intended to be published and versioned so other repositories can consume it using `uses: digicert/digicert-code-monitoring-action@<tag>`.
 
 The project is released under the MIT license.
 
@@ -31,8 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: DigiCert Scan
-        uses: digicert/srm-github-action@v1
+      - name: DigiCert Code Monitoring
+        uses: digicert/digicert-code-monitoring-action@v1
         with:
           region: us
           api-key: ${{ secrets.DC_API_KEY }}
@@ -55,8 +55,8 @@ When `with-release: "true"`, `name` and `tag` are required and scan name is buil
 Example:
 
 ```yaml
-- name: DigiCert Scan (Release)
-  uses: digicert/srm-github-action@v1
+- name: DigiCert Code Monitoring (Release)
+  uses: digicert/digicert-code-monitoring-action@v1
   with:
     region: us
     api-key: ${{ secrets.DC_API_KEY }}

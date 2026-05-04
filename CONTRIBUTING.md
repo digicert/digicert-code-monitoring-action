@@ -1,4 +1,4 @@
-# Contributing to DigiCert Software Trust Manager -Software Release Monitoring GitHub Action
+# Contributing to DigiCert Software Trust Manager -DigiCert Code Monitoring Action
 
 Thank you for your interest in contributing to this project. This document explains how to get help, report bugs, request features, submit pull requests, and manage security.
 
