@@ -18,7 +18,7 @@ Scan results are securely transmitted to the DigiCert backend for centralized an
 - Automate multi-language security scanning without manual configuration.
 - Gain visibility into your software supply chain through SBOM generation.
 - Centralize scan results within the DigiCert backend for analysis and management.
-- Integrate security scanning seamlessly into GitHub Actions workflow.s
+- Integrate security scanning seamlessly into GitHub Actions workflows.
 - Align security scans with your release lifecycle for better traceability.
 
 ## Before you begin
