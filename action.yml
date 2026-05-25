@@ -152,7 +152,12 @@ runs:
         echo "Preparing CAS at: $URL"
 
         REPO_FULL_NAME="${GITHUB_REPOSITORY:-${DC_OWNER}/${DC_REPO}}"
-        REF_NAME="${GITHUB_REF_NAME:-}"
+        if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] || [ "${GITHUB_EVENT_NAME:-}" = "pull_request_target" ]; then
+          REF_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+        else
+          REF_NAME="${GITHUB_REF_NAME:-}"
+        fi
+        TRIGGERED_BY="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-}}"
 
         payload="$(jq -cn \
           --arg scanName "$SCAN_NAME" \
@@ -164,6 +169,9 @@ runs:
           --arg ref "${GITHUB_REF:-${DC_REF}}" \
           --arg refName "$REF_NAME" \
           --arg sha "${GITHUB_SHA:-}" \
+          --arg actor "${GITHUB_ACTOR:-}" \
+          --arg triggeringActor "${GITHUB_TRIGGERING_ACTOR:-}" \
+          --arg triggeredBy "$TRIGGERED_BY" \
           --arg runId "${GITHUB_RUN_ID:-}" \
           --arg runAttempt "${GITHUB_RUN_ATTEMPT:-}" \
           --arg workflow "${GITHUB_WORKFLOW:-}" \
@@ -181,6 +189,9 @@ runs:
               ref: $ref,
               refName: $refName,
               sha: $sha,
+              actor: $actor,
+              triggeringActor: $triggeringActor,
+              triggeredBy: $triggeredBy,
               eventName: $eventName,
               workflow: $workflow,
               workflowRef: $workflowRef,
@@ -336,7 +347,12 @@ runs:
         CORRELATION_ID="$DC_CAS_ID"
 
         REPO_FULL_NAME="${GITHUB_REPOSITORY:-${DC_OWNER}/${DC_REPO}}"
-        REF_NAME="${GITHUB_REF_NAME:-}"
+        if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] || [ "${GITHUB_EVENT_NAME:-}" = "pull_request_target" ]; then
+          REF_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+        else
+          REF_NAME="${GITHUB_REF_NAME:-}"
+        fi
+        TRIGGERED_BY="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-}}"
 
         # For best per-language behavior, run one job per language (matrix)
         # and post each language's SARIF separately.
@@ -356,6 +372,9 @@ runs:
           --arg ref "${GITHUB_REF:-${DC_REF}}" \
           --arg refName "$REF_NAME" \
           --arg sha "${GITHUB_SHA:-}" \
+          --arg actor "${GITHUB_ACTOR:-}" \
+          --arg triggeringActor "${GITHUB_TRIGGERING_ACTOR:-}" \
+          --arg triggeredBy "$TRIGGERED_BY" \
           --arg workflow "${GITHUB_WORKFLOW:-}" \
           --arg workflowRef "${GITHUB_WORKFLOW_REF:-}" \
           --arg job "${GITHUB_JOB:-}" \
@@ -374,6 +393,9 @@ runs:
               ref: $ref,
               refName: $refName,
               sha: $sha,
+              actor: $actor,
+              triggeringActor: $triggeringActor,
+              triggeredBy: $triggeredBy,
               eventName: $eventName,
               workflow: $workflow,
               workflowRef: $workflowRef,
@@ -501,7 +523,12 @@ runs:
         CORRELATION_ID="$DC_CAS_ID"
 
         REPO_FULL_NAME="${GITHUB_REPOSITORY:-${DC_OWNER}/${DC_REPO}}"
-        REF_NAME="${GITHUB_REF_NAME:-}"
+        if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] || [ "${GITHUB_EVENT_NAME:-}" = "pull_request_target" ]; then
+          REF_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+        else
+          REF_NAME="${GITHUB_REF_NAME:-}"
+        fi
+        TRIGGERED_BY="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-}}"
 
         payload="$(jq -cn \
           --arg correlationId "$CORRELATION_ID" \
@@ -514,6 +541,9 @@ runs:
           --arg ref "${GITHUB_REF:-${DC_REF}}" \
           --arg refName "$REF_NAME" \
           --arg sha "${GITHUB_SHA:-}" \
+          --arg actor "${GITHUB_ACTOR:-}" \
+          --arg triggeringActor "${GITHUB_TRIGGERING_ACTOR:-}" \
+          --arg triggeredBy "$TRIGGERED_BY" \
           --arg workflow "${GITHUB_WORKFLOW:-}" \
           --arg workflowRef "${GITHUB_WORKFLOW_REF:-}" \
           --arg job "${GITHUB_JOB:-}" \
@@ -532,6 +562,9 @@ runs:
               ref: $ref,
               refName: $refName,
               sha: $sha,
+              actor: $actor,
+              triggeringActor: $triggeringActor,
+              triggeredBy: $triggeredBy,
               eventName: $eventName,
               workflow: $workflow,
               workflowRef: $workflowRef,
