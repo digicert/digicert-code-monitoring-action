@@ -40,6 +40,9 @@ Before you begin, review the following prerequisites:
 - Prefer pinning third-party actions to a commit SHA in high-trust environments.
 - Validate all user-provided workflow inputs in caller workflows when possible.
 - Grant minimal required permissions (`contents: read`, `actions: read` only)
+- Do not run this action on `pull_request_target`; use `pull_request`, `push`, or `workflow_dispatch`.
+
+**Important:** This action intentionally fails fast when triggered by `pull_request_target` to prevent secrets from being exposed to untrusted fork code.
 
 ### Performance
 

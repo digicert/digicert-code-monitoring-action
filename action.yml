@@ -31,12 +31,117 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Block unsafe pull_request_target trigger
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ "${GITHUB_EVENT_NAME:-}" = "pull_request_target" ]; then
+          echo "This action must not run on pull_request_target due to secret exposure risk." >&2
+          echo "Use pull_request (or push/workflow_dispatch) instead." >&2
+          exit 1
+        fi
+
+    - name: Sanitize and normalize action inputs
+      shell: bash
+      env:
+        RAW_ENV: ${{ inputs.env }}
+        RAW_REGION: ${{ inputs.region }}
+        RAW_API_KEY: ${{ inputs.api-key }}
+        RAW_NAME: ${{ inputs.name }}
+        RAW_WITH_RELEASE: ${{ inputs.with-release }}
+        RAW_TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+
+        # Reject control characters (including CR/LF) to prevent shell/header injection.
+        reject_control_chars() {
+          local value="$1"
+          if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            return 1
+          fi
+          return 0
+        }
+
+        INPUT_ENV="$(printf '%s' "${RAW_ENV:-prod}" | tr '[:upper:]' '[:lower:]' | xargs)"
+        if [ -z "$INPUT_ENV" ]; then
+          INPUT_ENV="prod"
+        fi
+        case "$INPUT_ENV" in
+          prod|stage)
+            ;;
+          *)
+            echo "Unsupported env: '$INPUT_ENV' (use prod|stage)" >&2
+            exit 1
+            ;;
+        esac
+
+        INPUT_WITH_RELEASE="$(printf '%s' "${RAW_WITH_RELEASE:-false}" | tr '[:upper:]' '[:lower:]' | xargs)"
+        if [ -z "$INPUT_WITH_RELEASE" ]; then
+          INPUT_WITH_RELEASE="false"
+        fi
+        case "$INPUT_WITH_RELEASE" in
+          true|false)
+            ;;
+          *)
+            echo "Invalid with-release input: '$INPUT_WITH_RELEASE' (use true|false)" >&2
+            exit 1
+            ;;
+        esac
+
+        INPUT_REGION="$(printf '%s' "${RAW_REGION:-}" | xargs)"
+        if [ -z "$INPUT_REGION" ]; then
+          echo "Input 'region' is required." >&2
+          exit 1
+        fi
+        if ! reject_control_chars "$INPUT_REGION"; then
+          echo "Invalid region: contains control characters." >&2
+          exit 1
+        fi
+        if ! printf '%s' "$INPUT_REGION" | LC_ALL=C grep -Eq '^[A-Za-z0-9._-]{1,32}$'; then
+          echo "Invalid region format: use 1-32 chars [A-Za-z0-9._-]." >&2
+          exit 1
+        fi
+
+        INPUT_API_KEY="${RAW_API_KEY:-}"
+        if [ -z "$INPUT_API_KEY" ]; then
+          echo "Input 'api-key' is required." >&2
+          exit 1
+        fi
+        if ! reject_control_chars "$INPUT_API_KEY"; then
+          echo "Invalid api-key: contains control characters." >&2
+          exit 1
+        fi
+
+        INPUT_NAME="${RAW_NAME:-}"
+        INPUT_TAG="${RAW_TAG:-}"
+        if ! reject_control_chars "$INPUT_NAME"; then
+          echo "Invalid name: contains control characters." >&2
+          exit 1
+        fi
+        if ! reject_control_chars "$INPUT_TAG"; then
+          echo "Invalid tag: contains control characters." >&2
+          exit 1
+        fi
+
+        {
+          echo "DC_INPUT_ENV=$INPUT_ENV"
+          echo "DC_INPUT_REGION=$INPUT_REGION"
+          echo "DC_INPUT_WITH_RELEASE=$INPUT_WITH_RELEASE"
+          echo "DC_INPUT_NAME<<__DC_EOF__"
+          echo "$INPUT_NAME"
+          echo "__DC_EOF__"
+          echo "DC_INPUT_TAG<<__DC_EOF__"
+          echo "$INPUT_TAG"
+          echo "__DC_EOF__"
+        } >> "$GITHUB_ENV"
+
     - name: Resolve backend base URL
       shell: bash
       run: |
         set -euo pipefail
 
-        case "${{ inputs.env }}" in
+        case "${DC_INPUT_ENV}" in
           prod)
             echo "BACKEND_BASE_URL=https://releasemonitor.digicert.com" >> "$GITHUB_ENV"
             ;;
@@ -44,13 +149,15 @@ runs:
             echo "BACKEND_BASE_URL=https://releasemonitor.stage.az.digicert.net" >> "$GITHUB_ENV"
             ;;
           *)
-            echo "Unsupported env: '${{ inputs.env }}' (use prod|stage)" >&2
+            echo "Unsupported env: '${DC_INPUT_ENV}' (use prod|stage)" >&2
             exit 1
             ;;
         esac
 
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      with:
+        persist-credentials: false
 
     - name: Resolve repo context (owner/repo/ref)
       shell: bash
@@ -74,7 +181,11 @@ runs:
 
         echo "DC_OWNER=$DC_OWNER" >> "$GITHUB_ENV"
         echo "DC_REPO=$DC_REPO" >> "$GITHUB_ENV"
-        echo "DC_REF=$DC_REF" >> "$GITHUB_ENV"
+        {
+          echo "DC_REF<<__DC_EOF__"
+          echo "$DC_REF"
+          echo "__DC_EOF__"
+        } >> "$GITHUB_ENV"
 
         # Action constants (avoid additional inputs).
         echo "DC_CODEQL_BUILD_MODE=none" >> "$GITHUB_ENV"
@@ -82,6 +193,10 @@ runs:
         echo "DC_SARIF_ARTIFACT_NAME=digicert_scan_results" >> "$GITHUB_ENV"
         echo "DC_SBOM_OUTPUT=sbom.cyclonedx.json" >> "$GITHUB_ENV"
         echo "DC_SBOM_ARTIFACT_NAME=sbom-cyclonedx" >> "$GITHUB_ENV"
+        echo "DC_CURL_CONNECT_TIMEOUT=10" >> "$GITHUB_ENV"
+        echo "DC_CURL_MAX_TIME=60" >> "$GITHUB_ENV"
+        echo "DC_CURL_RETRY_COUNT=3" >> "$GITHUB_ENV"
+        echo "DC_CURL_RETRY_DELAY=2" >> "$GITHUB_ENV"
 
         # Default: run the scan unless backend prepare says otherwise.
         echo "DC_SHOULD_RUN=true" >> "$GITHUB_ENV"
@@ -89,10 +204,12 @@ runs:
     - name: Prepare Code Analysis Scan (name)
       id: cas_prepare
       shell: bash
+      env:
+        DC_INPUT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
 
-        WITH_RELEASE_RAW="${{ inputs.with-release }}"
+        WITH_RELEASE_RAW="${DC_INPUT_WITH_RELEASE}"
         WITH_RELEASE="$(echo "${WITH_RELEASE_RAW:-false}" | tr '[:upper:]' '[:lower:]' | xargs)"
         if [ -z "$WITH_RELEASE" ]; then
           WITH_RELEASE="false"
@@ -113,8 +230,8 @@ runs:
           WITH_RELEASE_JSON=false
         fi
 
-        NAME_RAW="${{ inputs.name }}"
-        TAG_RAW="${{ inputs.tag }}"
+        NAME_RAW="${DC_INPUT_NAME}"
+        TAG_RAW="${DC_INPUT_TAG}"
         TAG="$(echo "${TAG_RAW:-}" | xargs || true)"
 
         if [ "$WITH_RELEASE" = "true" ]; then
@@ -201,10 +318,18 @@ runs:
             }
           }')"
 
+        HEADER_FILE="$(mktemp)"
+        trap 'rm -f "$HEADER_FILE"' EXIT
+        printf 'X-API-KEY: %s\nX-DCONE-REGION: %s\n' "${DC_INPUT_API_KEY}" "${DC_INPUT_REGION}" > "$HEADER_FILE"
+
         raw="$(curl -sS -X POST "$URL" \
+          --connect-timeout "${DC_CURL_CONNECT_TIMEOUT}" \
+          --max-time "${DC_CURL_MAX_TIME}" \
+          --retry "${DC_CURL_RETRY_COUNT}" \
+          --retry-delay "${DC_CURL_RETRY_DELAY}" \
+          --retry-all-errors \
           -H "Content-Type: application/json" \
-          -H "X-API-KEY: ${{ inputs.api-key }}" \
-          -H "X-DCONE-REGION: ${{ inputs.region }}" \
+          -H @"$HEADER_FILE" \
           --data-raw "$payload" \
           -w $'\n%{http_code}')"
 
@@ -212,12 +337,16 @@ runs:
         status="${raw##*$'\n'}"
 
         if [ -z "$status" ] || ! [[ "$status" =~ ^[0-9][0-9][0-9]$ ]]; then
-          echo "Failed to prepare CAS (no HTTP status). Response: $raw" >&2
+          echo "Failed to prepare CAS (no valid HTTP status from backend)." >&2
           exit 1
         fi
 
         if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-          echo "Failed to prepare CAS (HTTP $status). Response body: $body" >&2
+          ERR_MSG="$(echo "$body" | jq -r '.error.message? // .error? // .message? // empty' 2>/dev/null || true)"
+          if [ -z "$ERR_MSG" ]; then
+            ERR_MSG="Backend returned HTTP $status"
+          fi
+          echo "Failed to prepare CAS (HTTP $status). Error: $ERR_MSG" >&2
           exit 1
         fi
 
@@ -225,20 +354,43 @@ runs:
         SHOULD_RUN="$(echo "$body" | jq -r 'if has("shouldRun") then (.shouldRun | tostring) else empty end')"
 
         if [ -z "$CAS_ID" ]; then
-          echo "Backend did not return CAS id. Response body: $body" >&2
+          echo "Backend did not return CAS id." >&2
           exit 1
         fi
 
         if [ -z "$SHOULD_RUN" ]; then
-          echo "Backend did not return shouldRun. Response body: $body" >&2
+          echo "Backend did not return shouldRun." >&2
           exit 1
         fi
 
-        echo "DC_CAS_ID=$CAS_ID" >> "$GITHUB_ENV"
-        echo "DC_SHOULD_RUN=$SHOULD_RUN" >> "$GITHUB_ENV"
+        if ! printf '%s' "$CAS_ID" | LC_ALL=C grep -Eq '^[A-Za-z0-9._-]{1,128}$'; then
+          echo "Invalid CAS_ID format from backend." >&2
+          exit 1
+        fi
 
-        echo "id=$CAS_ID" >> "$GITHUB_OUTPUT"
-        echo "shouldRun=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+        case "$SHOULD_RUN" in
+          true|false) ;;
+          *) echo "Unexpected shouldRun value from backend: '$SHOULD_RUN'" >&2; exit 1 ;;
+        esac
+
+        _DELIM="$(openssl rand -hex 16)"
+        {
+          printf 'DC_CAS_ID<<%s\n' "$_DELIM"
+          printf '%s\n' "$CAS_ID"
+          printf '%s\n' "$_DELIM"
+          printf 'DC_SHOULD_RUN<<%s\n' "$_DELIM"
+          printf '%s\n' "$SHOULD_RUN"
+          printf '%s\n' "$_DELIM"
+        } >> "$GITHUB_ENV"
+
+        {
+          printf 'id<<%s\n' "$_DELIM"
+          printf '%s\n' "$CAS_ID"
+          printf '%s\n' "$_DELIM"
+          printf 'shouldRun<<%s\n' "$_DELIM"
+          printf '%s\n' "$SHOULD_RUN"
+          printf '%s\n' "$_DELIM"
+        } >> "$GITHUB_OUTPUT"
 
         if [ "$SHOULD_RUN" != "true" ]; then
           echo "Scan already completed or in progress; skipping (shouldRun=$SHOULD_RUN)."
@@ -248,25 +400,39 @@ runs:
       id: langs
       shell: bash
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
+      env:
+        DC_INPUT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
 
         URL="${BACKEND_BASE_URL}/releasemonitor/api/v1/gha/code-analysis/languages"
         echo "Fetching languages from: $URL"
 
+        HEADER_FILE="$(mktemp)"
+        trap 'rm -f "$HEADER_FILE"' EXIT
+        printf 'X-API-KEY: %s\nX-DCONE-REGION: %s\n' "${DC_INPUT_API_KEY}" "${DC_INPUT_REGION}" > "$HEADER_FILE"
+
         # Requires jq on runner (ubuntu has it)
         # Capture body + status code to handle API errors gracefully.
         if [ -n "${DC_REF}" ]; then
           RAW="$(curl -sS -G "$URL" \
-            -H "X-API-KEY: ${{ inputs.api-key }}" \
-            -H "X-DCONE-REGION: ${{ inputs.region }}" \
+              --connect-timeout "${DC_CURL_CONNECT_TIMEOUT}" \
+              --max-time "${DC_CURL_MAX_TIME}" \
+              --retry "${DC_CURL_RETRY_COUNT}" \
+              --retry-delay "${DC_CURL_RETRY_DELAY}" \
+              --retry-all-errors \
+            -H @"$HEADER_FILE" \
             --data-urlencode "repo=${DC_REPO}" \
             --data-urlencode "ref=${DC_REF}" \
             -w $'\n%{http_code}')"
         else
           RAW="$(curl -sS -G "$URL" \
-            -H "X-API-KEY: ${{ inputs.api-key }}" \
-            -H "X-DCONE-REGION: ${{ inputs.region }}" \
+              --connect-timeout "${DC_CURL_CONNECT_TIMEOUT}" \
+              --max-time "${DC_CURL_MAX_TIME}" \
+              --retry "${DC_CURL_RETRY_COUNT}" \
+              --retry-delay "${DC_CURL_RETRY_DELAY}" \
+              --retry-all-errors \
+            -H @"$HEADER_FILE" \
             --data-urlencode "repo=${DC_REPO}" \
             -w $'\n%{http_code}')"
         fi
@@ -275,7 +441,7 @@ runs:
         STATUS="${RAW##*$'\n'}"
 
         if [ -z "$STATUS" ] || ! [[ "$STATUS" =~ ^[0-9][0-9][0-9]$ ]]; then
-          echo "Failed to call backend (no HTTP status). Response: $RAW" >&2
+          echo "Failed to call backend (no valid HTTP status)." >&2
           exit 1
         fi
 
@@ -285,7 +451,6 @@ runs:
             ERR_MSG="Backend returned HTTP $STATUS"
           fi
           echo "Failed to fetch languages: $ERR_MSG" >&2
-          echo "Backend response body: $BODY" >&2
           exit 1
         fi
 
@@ -295,23 +460,40 @@ runs:
 
         if [ -z "$LANGS" ] || [ "$LANGS" = "null" ]; then
           echo "No languages returned by backend." >&2
-          echo "Backend response body: $BODY" >&2
           exit 1
         fi
 
-        echo "LANGS=$LANGS" >> "$GITHUB_ENV"
-        echo "languages=$LANGS" >> "$GITHUB_OUTPUT"
+        IFS=',' read -ra _LANG_ARR <<< "$LANGS"
+        for _lang in "${_LANG_ARR[@]}"; do
+          if ! printf '%s' "$_lang" | LC_ALL=C grep -Eq '^[a-z-]{1,32}$'; then
+            echo "Invalid language identifier from backend: '$_lang'" >&2
+            exit 1
+          fi
+        done
+        unset _LANG_ARR _lang
+
+        _DELIM="$(openssl rand -hex 16)"
+        {
+          printf 'LANGS<<%s\n' "$_DELIM"
+          printf '%s\n' "$LANGS"
+          printf '%s\n' "$_DELIM"
+        } >> "$GITHUB_ENV"
+        {
+          printf 'languages<<%s\n' "$_DELIM"
+          printf '%s\n' "$LANGS"
+          printf '%s\n' "$_DELIM"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Initialize CodeQL
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
-      uses: github/codeql-action/init@v4
+      uses: github/codeql-action/init@411bbbe57033eedfc1a82d68c01345aa96c737d7 # v4
       with:
         languages: ${{ steps.langs.outputs.languages }}
         build-mode: ${{ env.DC_CODEQL_BUILD_MODE }}
 
     - name: Perform CodeQL Analysis
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
-      uses: github/codeql-action/analyze@v4
+      uses: github/codeql-action/analyze@411bbbe57033eedfc1a82d68c01345aa96c737d7 # v4
       with:
         upload: false
         output: ${{ env.DC_SARIF_OUTPUT }}
@@ -319,18 +501,24 @@ runs:
     - name: Upload SARIF result as artifact
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
       id: upload_sarif
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       with:
         name: ${{ env.DC_SARIF_ARTIFACT_NAME }}
         path: ${{ env.DC_SARIF_OUTPUT }}
+        if-no-files-found: error
+        retention-days: 1
 
     - name: Post SARIF to backend
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
       shell: bash
+      env:
+        DC_INPUT_API_KEY: ${{ inputs.api-key }}
+        SARIF_ARTIFACT_ID: ${{ steps.upload_sarif.outputs.artifact-id }}
+        LANGS_OUTPUT: ${{ steps.langs.outputs.languages }}
       run: |
         set -euo pipefail
 
-        ARTIFACT_ID="${{ steps.upload_sarif.outputs.artifact-id }}"
+        ARTIFACT_ID="${SARIF_ARTIFACT_ID}"
         ARTIFACT_NAME="${DC_SARIF_ARTIFACT_NAME}"
 
         if [ -z "$ARTIFACT_ID" ]; then
@@ -356,7 +544,7 @@ runs:
 
         # For best per-language behavior, run one job per language (matrix)
         # and post each language's SARIF separately.
-        LANGS_RAW="${{ steps.langs.outputs.languages }}"
+        LANGS_RAW="${LANGS_OUTPUT}"
         LANGS_CSV="$(echo "$LANGS_RAW" | tr -d ' ' || true)"
         if [ -z "$LANGS_CSV" ]; then
           LANGS_CSV="auto"
@@ -409,12 +597,20 @@ runs:
             sarifFileName: "artifact.zip"
           }')"
 
+        HEADER_FILE="$(mktemp)"
+        trap 'rm -f "$HEADER_FILE"' EXIT
+        printf 'X-API-KEY: %s\nX-DCONE-REGION: %s\n' "${DC_INPUT_API_KEY}" "${DC_INPUT_REGION}" > "$HEADER_FILE"
+
         echo "Triggering backend SARIF processing at: $URL (artifactId=$ARTIFACT_ID, artifactName=$ARTIFACT_NAME)"
 
         raw="$(curl -sS -X POST "$URL" \
+          --connect-timeout "${DC_CURL_CONNECT_TIMEOUT}" \
+          --max-time "${DC_CURL_MAX_TIME}" \
+          --retry "${DC_CURL_RETRY_COUNT}" \
+          --retry-delay "${DC_CURL_RETRY_DELAY}" \
+          --retry-all-errors \
           -H "Content-Type: application/json" \
-          -H "X-API-KEY: ${{ inputs.api-key }}" \
-          -H "X-DCONE-REGION: ${{ inputs.region }}" \
+          -H @"$HEADER_FILE" \
           --data-raw "$payload" \
           -w $'\n%{http_code}')"
 
@@ -422,12 +618,16 @@ runs:
         status="${raw##*$'\n'}"
 
         if [ -z "$status" ] || ! [[ "$status" =~ ^[0-9][0-9][0-9]$ ]]; then
-          echo "Failed to trigger SARIF processing (no HTTP status). Response: $raw" >&2
+          echo "Failed to trigger SARIF processing (no valid HTTP status)." >&2
           exit 1
         fi
 
         if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-          echo "Failed to trigger SARIF processing (HTTP $status). Response body: $body" >&2
+          ERR_MSG="$(echo "$body" | jq -r '.error.message? // .error? // .message? // empty' 2>/dev/null || true)"
+          if [ -z "$ERR_MSG" ]; then
+            ERR_MSG="Backend returned HTTP $status"
+          fi
+          echo "Failed to trigger SARIF processing (HTTP $status). Error: $ERR_MSG" >&2
           exit 1
         fi
 
@@ -437,6 +637,8 @@ runs:
       if: ${{ always() && env.DC_SHOULD_RUN == 'true' }}
       continue-on-error: true
       shell: bash
+      env:
+        DC_INPUT_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
 
@@ -461,10 +663,18 @@ runs:
           --arg failureStage "composite" \
           '{ status: $status, message: $message, failureStage: $failureStage }')"
 
+        HEADER_FILE="$(mktemp)"
+        trap 'rm -f "$HEADER_FILE"' EXIT
+        printf 'X-API-KEY: %s\nX-DCONE-REGION: %s\n' "${DC_INPUT_API_KEY}" "${DC_INPUT_REGION}" > "$HEADER_FILE"
+
         raw="$(curl -sS -X POST "$URL" \
+          --connect-timeout "${DC_CURL_CONNECT_TIMEOUT}" \
+          --max-time "${DC_CURL_MAX_TIME}" \
+          --retry "${DC_CURL_RETRY_COUNT}" \
+          --retry-delay "${DC_CURL_RETRY_DELAY}" \
+          --retry-all-errors \
           -H "Content-Type: application/json" \
-          -H "X-API-KEY: ${{ inputs.api-key }}" \
-          -H "X-DCONE-REGION: ${{ inputs.region }}" \
+          -H @"$HEADER_FILE" \
           --data-raw "$payload" \
           -w $'\n%{http_code}')"
 
@@ -472,12 +682,16 @@ runs:
         status="${raw##*$'\n'}"
 
         if [ -z "$status" ] || ! [[ "$status" =~ ^[0-9][0-9][0-9]$ ]]; then
-          echo "Finalize CAS failed (no HTTP status). Response: $raw" >&2
+          echo "Finalize CAS failed (no valid HTTP status)." >&2
           exit 0
         fi
 
         if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-          echo "Finalize CAS failed (HTTP $status). Response body: $body" >&2
+          ERR_MSG="$(echo "$body" | jq -r '.error.message? // .error? // .message? // empty' 2>/dev/null || true)"
+          if [ -z "$ERR_MSG" ]; then
+            ERR_MSG="Backend returned HTTP $status"
+          fi
+          echo "Finalize CAS failed (HTTP $status). Error: $ERR_MSG" >&2
           exit 0
         fi
 
@@ -485,7 +699,7 @@ runs:
 
     - name: Generate SBOM (Trivy CycloneDX)
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
-      uses: aquasecurity/trivy-action@v0.35.0
+      uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
       with:
         scan-type: "fs"
         format: "cyclonedx"
@@ -494,14 +708,19 @@ runs:
     - name: Upload SBOM as artifact
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
       id: upload_sbom
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       with:
         name: ${{ env.DC_SBOM_ARTIFACT_NAME }}
         path: ${{ env.DC_SBOM_OUTPUT }}
+        if-no-files-found: error
+        retention-days: 1
 
     - name: Post SBOM to backend
       if: ${{ env.DC_SHOULD_RUN == 'true' }}
       shell: bash
+      env:
+        DC_INPUT_API_KEY: ${{ inputs.api-key }}
+        SBOM_ARTIFACT_ID: ${{ steps.upload_sbom.outputs.artifact-id }}
       run: |
         set -euo pipefail
 
@@ -510,7 +729,7 @@ runs:
           exit 1
         fi
 
-        ARTIFACT_ID="${{ steps.upload_sbom.outputs.artifact-id }}"
+        ARTIFACT_ID="${SBOM_ARTIFACT_ID}"
         ARTIFACT_NAME="${DC_SBOM_ARTIFACT_NAME}"
 
         if [ -z "$ARTIFACT_ID" ]; then
@@ -574,12 +793,20 @@ runs:
             }
           }')"
 
+        HEADER_FILE="$(mktemp)"
+        trap 'rm -f "$HEADER_FILE"' EXIT
+        printf 'X-API-KEY: %s\nX-DCONE-REGION: %s\n' "${DC_INPUT_API_KEY}" "${DC_INPUT_REGION}" > "$HEADER_FILE"
+
         echo "Triggering backend SBOM processing at: $URL (artifactId=$ARTIFACT_ID, artifactName=$ARTIFACT_NAME, correlationId=$CORRELATION_ID)"
 
         raw="$(curl -sS -X POST "$URL" \
+          --connect-timeout "${DC_CURL_CONNECT_TIMEOUT}" \
+          --max-time "${DC_CURL_MAX_TIME}" \
+          --retry "${DC_CURL_RETRY_COUNT}" \
+          --retry-delay "${DC_CURL_RETRY_DELAY}" \
+          --retry-all-errors \
           -H "Content-Type: application/json" \
-          -H "X-API-KEY: ${{ inputs.api-key }}" \
-          -H "X-DCONE-REGION: ${{ inputs.region }}" \
+          -H @"$HEADER_FILE" \
           --data-raw "$payload" \
           -w $'\n%{http_code}')"
 
@@ -587,12 +814,16 @@ runs:
         status="${raw##*$'\n'}"
 
         if [ -z "$status" ] || ! [[ "$status" =~ ^[0-9][0-9][0-9]$ ]]; then
-          echo "Failed to trigger SBOM processing (no HTTP status). Response: $raw" >&2
+          echo "Failed to trigger SBOM processing (no valid HTTP status)." >&2
           exit 1
         fi
 
         if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-          echo "Failed to trigger SBOM processing (HTTP $status). Response body: $body" >&2
+          ERR_MSG="$(echo "$body" | jq -r '.error.message? // .error? // .message? // empty' 2>/dev/null || true)"
+          if [ -z "$ERR_MSG" ]; then
+            ERR_MSG="Backend returned HTTP $status"
+          fi
+          echo "Failed to trigger SBOM processing (HTTP $status). Error: $ERR_MSG" >&2
           exit 1
         fi
 
