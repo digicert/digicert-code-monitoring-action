@@ -27,6 +27,11 @@ inputs:
     description: "Release tag used only when with-release is true (required when with-release is true)."
     required: false
 
+  dc-release-id:
+    description: "Optional pre-existing DCOne release ID. When provided, the action verifies it and reuses it instead of creating a new release."
+    required: false
+    default: ""
+
   languages:
     description: "Comma-separated CodeQL languages override (e.g. 'java,javascript'). Leave empty to auto-resolve from GitHub's detected languages via the gh CLI."
     required: false
@@ -126,6 +131,7 @@ runs:
         RAW_NAME: ${{ inputs.name }}
         RAW_WITH_RELEASE: ${{ inputs.with-release }}
         RAW_TAG: ${{ inputs.tag }}
+        RAW_RELEASE_ID: ${{ inputs.dc-release-id }}
         RAW_LANGUAGES: ${{ inputs.languages }}
         RAW_SBOM_SPEC: ${{ inputs.sbom-spec-version }}
         RAW_CDN: ${{ inputs.digicert-cdn }}
@@ -191,6 +197,11 @@ runs:
           echo "Invalid tag: contains control characters." >&2
           exit 1
         fi
+        INPUT_RELEASE_ID="${RAW_RELEASE_ID:-}"
+        if ! reject_control_chars "$INPUT_RELEASE_ID"; then
+          echo "Invalid dc-release-id: contains control characters." >&2
+          exit 1
+        fi
 
         # Languages: comma-separated, each token [a-z-]{1,32}. Empty is allowed (autodetect).
         INPUT_LANGUAGES="$(printf '%s' "${RAW_LANGUAGES:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -240,6 +251,9 @@ runs:
           echo "__DC_EOF__"
           echo "DC_INPUT_TAG<<__DC_EOF__"
           echo "$INPUT_TAG"
+          echo "__DC_EOF__"
+          echo "DC_INPUT_RELEASE_ID<<__DC_EOF__"
+          echo "$INPUT_RELEASE_ID"
           echo "__DC_EOF__"
           echo "DC_INPUT_LANGUAGES<<__DC_EOF__"
           echo "$INPUT_LANGUAGES"
@@ -509,6 +523,64 @@ runs:
         DC_INPUT_SOURCE: ${{ inputs.source }}
       run: |
         set -euo pipefail
+
+        PROVIDED_RELEASE_ID="$(printf '%s' "${DC_INPUT_RELEASE_ID:-}" | xargs)"
+        if [ -n "$PROVIDED_RELEASE_ID" ]; then
+          verify_url="${SM_HOST%/}/external-releases/${PROVIDED_RELEASE_ID}"
+          verify_body_file="$(mktemp)"
+          verify_err_file="$(mktemp)"
+          auth_header="X-Api-Key: ${SM_API_KEY}"
+          curl_rc=0
+          verify_status="$(
+            curl \
+              --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 60 \
+              --retry 2 \
+              --retry-delay 1 \
+              --retry-connrefused \
+              --header "$auth_header" \
+              --header "Accept: application/json" \
+              --output "$verify_body_file" \
+              --write-out "%{http_code}" \
+              "$verify_url" \
+              2>"$verify_err_file"
+          )" || curl_rc=$?
+
+          verify_reason=""
+          if [ "$curl_rc" -ne 0 ]; then
+            verify_reason="$(cat "$verify_err_file" 2>/dev/null || true)"
+            [ -z "$verify_reason" ] && verify_reason="request failed while contacting ${SM_HOST}"
+          elif [ "$verify_status" = "200" ]; then
+            if ! jq -e '. != null and (.id // .releaseId // .externalReleaseId // "") != ""' "$verify_body_file" >/dev/null 2>&1; then
+              verify_reason="response did not contain a usable release object"
+            fi
+          elif [ "$verify_status" = "404" ]; then
+            verify_reason="release was not found (HTTP 404)"
+          else
+            body_reason="$(jq -r '.message // .error // .detail // .title // empty' "$verify_body_file" 2>/dev/null || true)"
+            if [ -n "$body_reason" ]; then
+              verify_reason="HTTP ${verify_status}: ${body_reason}"
+            else
+              verify_reason="HTTP ${verify_status}"
+            fi
+          fi
+
+          rm -f "$verify_body_file" "$verify_err_file"
+
+          if [ -n "$verify_reason" ]; then
+            echo "Provided dc-release-id '${PROVIDED_RELEASE_ID}' could not be verified in DCOne: ${verify_reason}" >&2
+            exit 1
+          fi
+
+          {
+            echo "DC_RELEASE_ID<<__DC_EOF__"
+            echo "$PROVIDED_RELEASE_ID"
+            echo "__DC_EOF__"
+          } >> "$GITHUB_ENV"
+          echo "Using verified dc-release-id '${PROVIDED_RELEASE_ID}' and skipping release creation."
+          exit 0
+        fi
 
         WITH_RELEASE="${DC_INPUT_WITH_RELEASE}"
         NAME_RAW="${DC_INPUT_NAME}"
