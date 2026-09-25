@@ -526,59 +526,12 @@ runs:
 
         PROVIDED_RELEASE_ID="$(printf '%s' "${DC_INPUT_RELEASE_ID:-}" | xargs)"
         if [ -n "$PROVIDED_RELEASE_ID" ]; then
-          verify_url="${SM_HOST%/}/external-releases/${PROVIDED_RELEASE_ID}"
-          verify_body_file="$(mktemp)"
-          verify_err_file="$(mktemp)"
-          auth_header="X-Api-Key: ${SM_API_KEY}"
-          curl_rc=0
-          verify_status="$(
-            curl \
-              --silent --show-error \
-              --connect-timeout 10 \
-              --max-time 60 \
-              --retry 2 \
-              --retry-delay 1 \
-              --retry-connrefused \
-              --header "$auth_header" \
-              --header "Accept: application/json" \
-              --output "$verify_body_file" \
-              --write-out "%{http_code}" \
-              "$verify_url" \
-              2>"$verify_err_file"
-          )" || curl_rc=$?
-
-          verify_reason=""
-          if [ "$curl_rc" -ne 0 ]; then
-            verify_reason="$(cat "$verify_err_file" 2>/dev/null || true)"
-            [ -z "$verify_reason" ] && verify_reason="request failed while contacting ${SM_HOST}"
-          elif [ "$verify_status" = "200" ]; then
-            if ! jq -e '. != null and (.id // .releaseId // .externalReleaseId // "") != ""' "$verify_body_file" >/dev/null 2>&1; then
-              verify_reason="response did not contain a usable release object"
-            fi
-          elif [ "$verify_status" = "404" ]; then
-            verify_reason="release was not found (HTTP 404)"
-          else
-            body_reason="$(jq -r '.message // .error // .detail // .title // empty' "$verify_body_file" 2>/dev/null || true)"
-            if [ -n "$body_reason" ]; then
-              verify_reason="HTTP ${verify_status}: ${body_reason}"
-            else
-              verify_reason="HTTP ${verify_status}"
-            fi
-          fi
-
-          rm -f "$verify_body_file" "$verify_err_file"
-
-          if [ -n "$verify_reason" ]; then
-            echo "Provided dc-release-id '${PROVIDED_RELEASE_ID}' could not be verified in DCOne: ${verify_reason}" >&2
-            exit 1
-          fi
-
           {
             echo "DC_RELEASE_ID<<__DC_EOF__"
             echo "$PROVIDED_RELEASE_ID"
             echo "__DC_EOF__"
           } >> "$GITHUB_ENV"
-          echo "Using verified dc-release-id '${PROVIDED_RELEASE_ID}' and skipping release creation."
+          echo "Using provided dc-release-id '${PROVIDED_RELEASE_ID}' and skipping release creation."
           exit 0
         fi
 
