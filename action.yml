@@ -32,6 +32,16 @@ inputs:
     required: false
     default: ""
 
+  commit-sha:
+    description: "Optional commit SHA override used for checkout and all smctl --commit-sha arguments."
+    required: false
+    default: ""
+
+  branch:
+    description: "Optional branch name override used for checkout and smctl branch metadata arguments."
+    required: false
+    default: ""
+
   languages:
     description: "Comma-separated CodeQL languages override (e.g. 'java,javascript'). Leave empty to auto-resolve from GitHub's detected languages via the gh CLI."
     required: false
@@ -132,6 +142,8 @@ runs:
         RAW_WITH_RELEASE: ${{ inputs.with-release }}
         RAW_TAG: ${{ inputs.tag }}
         RAW_RELEASE_ID: ${{ inputs.dc-release-id }}
+        RAW_COMMIT_SHA: ${{ inputs.commit-sha }}
+        RAW_BRANCH: ${{ inputs.branch }}
         RAW_LANGUAGES: ${{ inputs.languages }}
         RAW_SBOM_SPEC: ${{ inputs.sbom-spec-version }}
         RAW_CDN: ${{ inputs.digicert-cdn }}
@@ -202,6 +214,16 @@ runs:
           echo "Invalid dc-release-id: contains control characters." >&2
           exit 1
         fi
+        INPUT_COMMIT_SHA="${RAW_COMMIT_SHA:-}"
+        if ! reject_control_chars "$INPUT_COMMIT_SHA"; then
+          echo "Invalid commit-sha: contains control characters." >&2
+          exit 1
+        fi
+        INPUT_BRANCH="${RAW_BRANCH:-}"
+        if ! reject_control_chars "$INPUT_BRANCH"; then
+          echo "Invalid branch: contains control characters." >&2
+          exit 1
+        fi
 
         # Languages: comma-separated, each token [a-z-]{1,32}. Empty is allowed (autodetect).
         INPUT_LANGUAGES="$(printf '%s' "${RAW_LANGUAGES:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -255,6 +277,12 @@ runs:
           echo "DC_INPUT_RELEASE_ID<<__DC_EOF__"
           echo "$INPUT_RELEASE_ID"
           echo "__DC_EOF__"
+          echo "DC_INPUT_COMMIT_SHA<<__DC_EOF__"
+          echo "$INPUT_COMMIT_SHA"
+          echo "__DC_EOF__"
+          echo "DC_INPUT_BRANCH<<__DC_EOF__"
+          echo "$INPUT_BRANCH"
+          echo "__DC_EOF__"
           echo "DC_INPUT_LANGUAGES<<__DC_EOF__"
           echo "$INPUT_LANGUAGES"
           echo "__DC_EOF__"
@@ -280,6 +308,8 @@ runs:
       uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       with:
         persist-credentials: false
+        ref: ${{ inputs.commit-sha != '' && inputs.commit-sha || inputs.branch != '' && inputs.branch || github.ref }}
+        fetch-depth: ${{ (inputs.commit-sha != '' || inputs.branch != '') && 0 || 1 }}
 
     # 5 -----------------------------------------------------------------------
     - name: Resolve repo context (owner/repo/ref)
@@ -287,6 +317,8 @@ runs:
       env:
         DC_GITLEAKS_VERSION_INPUT: ${{ inputs.gitleaks-version }}
         DC_CODEQL_TOOLS_VERSION_INPUT: ${{ inputs.codeql-tools-version }}
+        DC_INPUT_COMMIT_SHA: ${{ inputs.commit-sha }}
+        DC_INPUT_BRANCH: ${{ inputs.branch }}
       run: |
         set -euo pipefail
 
@@ -310,9 +342,18 @@ runs:
         else
           REF_NAME="${GITHUB_REF_NAME:-}"
         fi
+        REF_NAME_OVERRIDE="$(printf '%s' "${DC_INPUT_BRANCH:-}" | xargs)"
+        if [ -n "$REF_NAME_OVERRIDE" ]; then
+          REF_NAME="$REF_NAME_OVERRIDE"
+        fi
+        DC_COMMIT_SHA="$(printf '%s' "${DC_INPUT_COMMIT_SHA:-}" | xargs)"
+        if [ -z "$DC_COMMIT_SHA" ]; then
+          DC_COMMIT_SHA="${GITHUB_SHA:-}"
+        fi
 
         echo "DC_OWNER=$DC_OWNER" >> "$GITHUB_ENV"
         echo "DC_REPO=$DC_REPO" >> "$GITHUB_ENV"
+        echo "DC_COMMIT_SHA=$DC_COMMIT_SHA" >> "$GITHUB_ENV"
         {
           echo "DC_REF<<__DC_EOF__"
           echo "$DC_REF"
@@ -526,59 +567,12 @@ runs:
 
         PROVIDED_RELEASE_ID="$(printf '%s' "${DC_INPUT_RELEASE_ID:-}" | xargs)"
         if [ -n "$PROVIDED_RELEASE_ID" ]; then
-          verify_url="${SM_HOST%/}/external-releases/${PROVIDED_RELEASE_ID}"
-          verify_body_file="$(mktemp)"
-          verify_err_file="$(mktemp)"
-          auth_header="X-Api-Key: ${SM_API_KEY}"
-          curl_rc=0
-          verify_status="$(
-            curl \
-              --silent --show-error \
-              --connect-timeout 10 \
-              --max-time 60 \
-              --retry 2 \
-              --retry-delay 1 \
-              --retry-connrefused \
-              --header "$auth_header" \
-              --header "Accept: application/json" \
-              --output "$verify_body_file" \
-              --write-out "%{http_code}" \
-              "$verify_url" \
-              2>"$verify_err_file"
-          )" || curl_rc=$?
-
-          verify_reason=""
-          if [ "$curl_rc" -ne 0 ]; then
-            verify_reason="$(cat "$verify_err_file" 2>/dev/null || true)"
-            [ -z "$verify_reason" ] && verify_reason="request failed while contacting ${SM_HOST}"
-          elif [ "$verify_status" = "200" ]; then
-            if ! jq -e '. != null and (.id // .releaseId // .externalReleaseId // "") != ""' "$verify_body_file" >/dev/null 2>&1; then
-              verify_reason="response did not contain a usable release object"
-            fi
-          elif [ "$verify_status" = "404" ]; then
-            verify_reason="release was not found (HTTP 404)"
-          else
-            body_reason="$(jq -r '.message // .error // .detail // .title // empty' "$verify_body_file" 2>/dev/null || true)"
-            if [ -n "$body_reason" ]; then
-              verify_reason="HTTP ${verify_status}: ${body_reason}"
-            else
-              verify_reason="HTTP ${verify_status}"
-            fi
-          fi
-
-          rm -f "$verify_body_file" "$verify_err_file"
-
-          if [ -n "$verify_reason" ]; then
-            echo "Provided dc-release-id '${PROVIDED_RELEASE_ID}' could not be verified in DCOne: ${verify_reason}" >&2
-            exit 1
-          fi
-
           {
             echo "DC_RELEASE_ID<<__DC_EOF__"
             echo "$PROVIDED_RELEASE_ID"
             echo "__DC_EOF__"
           } >> "$GITHUB_ENV"
-          echo "Using verified dc-release-id '${PROVIDED_RELEASE_ID}' and skipping release creation."
+          echo "Using provided dc-release-id '${PROVIDED_RELEASE_ID}' and skipping release creation."
           exit 0
         fi
 
@@ -642,7 +636,7 @@ runs:
           --source "$INPUT_SOURCE"
           --name "$SCAN_NAME"
           --author "${GITHUB_ACTOR:-}"
-          --commit-sha "${GITHUB_SHA:-}"
+          --commit-sha "${DC_COMMIT_SHA:-}"
           --source-branch "${DC_REF_NAME:-}"
         )
 
@@ -989,7 +983,7 @@ runs:
             --release-id "${DC_RELEASE_ID}" \
             --scanner-type CODEQL \
             --ref-branch "${DC_REF_NAME:-}" \
-            --commit-sha "${GITHUB_SHA:-}"; then
+            --commit-sha "${DC_COMMIT_SHA:-}"; then
             echo "CodeQL SARIF upload: OK"
           else
             echo "CodeQL SARIF upload: FAILED" >&2
@@ -1007,7 +1001,7 @@ runs:
             --release-id "${DC_RELEASE_ID}" \
             --scanner-type GITLEAKS \
             --ref-branch "${DC_REF_NAME:-}" \
-            --commit-sha "${GITHUB_SHA:-}"; then
+            --commit-sha "${DC_COMMIT_SHA:-}"; then
             echo "Gitleaks SARIF upload: OK"
           else
             echo "Gitleaks SARIF upload: FAILED" >&2
@@ -1023,7 +1017,7 @@ runs:
           if smctl sbom upload \
             --file "${DC_SBOM_OUTPUT}" \
             --release-id "${DC_RELEASE_ID}" \
-            --commit-sha "${GITHUB_SHA:-}" \
+            --commit-sha "${DC_COMMIT_SHA:-}" \
             --ref-branch "${DC_REF_NAME:-}"; then
             echo "SBOM upload: OK"
           else
