@@ -115,6 +115,7 @@ Use an existing workflow file or create a new one.
 | `name` | No | `<workflow>-<event>`, or repository name when `with-release` is `true` | Auto-resolved when omitted |
 | `with-release` | No | `false` | Link to a release version; creates a `RELEASED` release |
 | `tag` | No | | Auto-resolved from a tag-push ref when `with-release` is `true` and omitted; otherwise required |
+| `dc-release-id` | No | Empty | Optional pre-created DCOne release id; when provided the action reuses it directly and skips `smctl release create` (no verification call) |
 | `languages` | No | Empty | Comma-separated CodeQL language override |
 | `codeql-build-mode` | No | `none` | Preferred build-mode for mixed repos: `none` (js/ts, python, ruby, java, c#) or `autobuild` (go, swift). Single-group repos auto-select |
 | `github-token` | No | `${{ github.token }}` | Token for GitHub API calls |
@@ -320,6 +321,8 @@ jobs:
 ### Release mode
 
 When `with-release: true`, the release name is built as `<name>-<tag>`. If `name` is omitted, it resolves to the repository name. If `tag` is omitted and the workflow was triggered by a tag push (`refs/tags/<tag>`), it resolves to that tag; otherwise `tag` must be passed explicitly.
+
+When `dc-release-id` is provided, the action reuses that release id directly for all uploads and skips `smctl release create` (no verification call is made). The caller is responsible for ensuring the provided release id is valid.
 
 Example:
 
