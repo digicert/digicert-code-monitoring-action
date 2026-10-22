@@ -2,7 +2,7 @@
 
 Automate and secure your application code workflows with DigiCert® Software Trust Manager code monitoring integrated into GitHub Actions.
 
-This feature enables continuous, automated code security scanning and software transparency directly within your CI/CD pipelines. It leverages CodeQL for multi-language analysis with automatic language detection, Gitleaks for secret scanning, and generates CycloneDX SBOMs via `smctl`, providing deep visibility into your software components and dependencies.
+This feature enables continuous, automated code security scanning and software transparency directly within your CI/CD pipelines. It leverages CodeQL for multi-language analysis with automatic language detection, Gitleaks for secret scanning, and generates CycloneDX SBOMs and CBOMs via `smctl`, providing deep visibility into your software components, dependencies, and cryptographic assets.
 
 Scan results are securely transmitted to DigiCert release monitoring for centralized analysis and management, while release tracking allows you to associate scans with specific application versions, helping strengthen your software supply chain security and compliance posture.
 
@@ -12,14 +12,14 @@ Scan results are securely transmitted to DigiCert release monitoring for central
 - Creates a `RELEASED` release for release-aligned scans.
 - Performs CodeQL analysis with explicitly supplied or GitHub-detected languages.
 - Performs Gitleaks secret scanning.
-- Generates SBOMs in CycloneDX format using `smctl` for dependency visibility.
+- Generates SBOMs and CBOMs in CycloneDX format using `smctl` for dependency and cryptographic asset visibility.
 - Securely uploads CodeQL and Gitleaks SARIF results to the release.
 
 **The DigiCert code monitoring action allows you to:**
 
 - Automate multi-language security scanning without manual configuration.
 - Detect secrets with Gitleaks.
-- Gain visibility into your software supply chain through SBOM generation.
+- Gain visibility into your software supply chain through SBOM and CBOM generation.
 - Centralize scan results within DigiCert release monitoring for analysis and management.
 - Integrate security scanning seamlessly into GitHub Actions workflows.
 - Align security scans with your release lifecycle for better traceability.
@@ -56,7 +56,7 @@ Before you begin, review the following prerequisites:
 - Auto-detection skips `C`/`C++` because they require a project-specific build; set `languages` explicitly (with a manual build) to scan them.
 - CodeQL runs a single build-mode per run. Repos with only build-free languages (js/ts, python, ruby, java, c#) use `none`; repos with only `go`/`swift` auto-use `autobuild`. For a repo that mixes both, `codeql-build-mode` picks which group to scan (default `none`).
 - Use `ubuntu-latest-xl` or another larger Linux x64 runner for large codebases.
-- Increase `scan-timeout` for repositories that need more time for Gitleaks and SBOM generation.
+- Increase `scan-timeout` for repositories that need more time for Gitleaks, SBOM, and CBOM generation.
 
 ### Maintenance
 
@@ -124,7 +124,6 @@ Use an existing workflow file or create a new one.
 | `released-at` | No | Empty | Optional release metadata shortcut; defaults to the current time when a timestamp is required and none is provided |
 | `source` | No | `GITHUB_ACTION` | Release source label (`GITHUB` or `GITHUB_ACTION`) |
 | `digicert-cdn` | No | DigiCert CDN | HTTPS URL for `smctl` |
-| `sbom-spec-version` | No | `1.6` | CycloneDX version: `1.5` or `1.6` |
 | `use-github-caching-service` | No | `true` | Cache `smctl` and Gitleaks |
 | `use-binary-sha256-checksum` | No | `true` | Verify and invalidate the `smctl` cache by checksum |
 | `cache-version` | No | `0.0.0-0` | Manual `smctl` cache-busting value |
