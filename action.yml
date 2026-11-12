@@ -2,7 +2,7 @@
 #
 # Code Monitoring Action v2.
 name: "DigiCert Code Monitoring Action v2 (smctl)"
-description: "Runs CodeQL + Gitleaks scans and generates an SBOM, then creates a release and uploads the results to DigiCert release monitoring via smctl."
+description: "Runs CodeQL + Gitleaks scans and generates an SBOM and CBOM, then creates a release and uploads the results to DigiCert release monitoring via smctl."
 author: "DigiCert"
 
 inputs:
@@ -82,11 +82,6 @@ inputs:
     required: false
     default: "https://pki-downloads.digicert.com/stm/latest"
 
-  sbom-spec-version:
-    description: "CycloneDX spec version for smctl sbom generate (1.5 or 1.6)."
-    required: false
-    default: "1.6"
-
   use-github-caching-service:
     description: "Cache downloaded tools (smctl, gitleaks) across runs. When false, tools download every run."
     required: false
@@ -145,7 +140,6 @@ runs:
         RAW_COMMIT_SHA: ${{ inputs.commit-sha }}
         RAW_BRANCH: ${{ inputs.branch }}
         RAW_LANGUAGES: ${{ inputs.languages }}
-        RAW_SBOM_SPEC: ${{ inputs.sbom-spec-version }}
         RAW_CDN: ${{ inputs.digicert-cdn }}
       run: |
         set -euo pipefail
@@ -238,16 +232,6 @@ runs:
           unset _LANG_ARR _lang
         fi
 
-        # SBOM spec version: 1.5 or 1.6.
-        INPUT_SBOM_SPEC="$(printf '%s' "${RAW_SBOM_SPEC:-1.6}" | xargs)"
-        case "$INPUT_SBOM_SPEC" in
-          1.5|1.6) ;;
-          *)
-            echo "Invalid sbom-spec-version: '$INPUT_SBOM_SPEC' (use 1.5 or 1.6)." >&2
-            exit 1
-            ;;
-        esac
-
         # CDN must be HTTPS (mirrors the signing action's downloadUrl guard).
         INPUT_CDN="$(printf '%s' "${RAW_CDN:-}" | xargs)"
         if ! reject_control_chars "$INPUT_CDN"; then
@@ -266,7 +250,6 @@ runs:
         {
           echo "DC_INPUT_HOST=$INPUT_HOST"
           echo "DC_INPUT_WITH_RELEASE=$INPUT_WITH_RELEASE"
-          echo "DC_INPUT_SBOM_SPEC=$INPUT_SBOM_SPEC"
           echo "DC_INPUT_CDN=$INPUT_CDN"
           echo "DC_INPUT_NAME<<__DC_EOF__"
           echo "$INPUT_NAME"
@@ -370,6 +353,7 @@ runs:
           echo "DC_CODEQL_SCAN_ZIP=codeql-scan.zip"
           echo "DC_GITLEAKS_SCAN_ZIP=gitleaks-scan.zip"
           echo "DC_SBOM_OUTPUT=sbom.cdx.json"
+          echo "DC_CBOM_OUTPUT=cbom.cdx.json"
           echo "DC_GITLEAKS_VERSION=${DC_GITLEAKS_VERSION_INPUT:-8.18.4}"
           echo "DC_CODEQL_TOOLS_VERSION=${DC_CODEQL_TOOLS_VERSION_INPUT:-}"
         } >> "$GITHUB_ENV"
@@ -728,9 +712,9 @@ runs:
         } >> "$GITHUB_ENV"
         echo "Release created: $rid"
 
-    # 7b — Start Gitleaks + SBOM generate as background jobs -----------------
+    # 7b — Start Gitleaks + SBOM + CBOM generate as background jobs ---------
     # CodeQL init/analyze (uses: steps) will run in parallel with these jobs.
-    - name: Start Gitleaks scan and SBOM generate (background)
+    - name: Start Gitleaks scan, SBOM and CBOM generate (background)
       shell: bash
       run: |
         set -euo pipefail
@@ -762,13 +746,23 @@ runs:
         (
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}"
-          smctl sbom generate \
+          smctl attest generate \
+            --type sbom \
             --path . \
-            --output "${DC_SBOM_OUTPUT}" \
-            --spec-version "${DC_INPUT_SBOM_SPEC}"
+            --output "${DC_SBOM_OUTPUT}"
         ) > "$DC_BG_WORK_DIR/sbom.log" 2>&1; echo $? > "$DC_BG_WORK_DIR/sbom.exit" &
 
-        echo "Gitleaks and SBOM generate started in background — CodeQL will run in parallel."
+        # CBOM generate — runs in a subshell; exit code written to .exit file when done.
+        (
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          smctl attest generate \
+            --type cbom \
+            --path . \
+            --output "${DC_CBOM_OUTPUT}"
+        ) > "$DC_BG_WORK_DIR/cbom.log" 2>&1; echo $? > "$DC_BG_WORK_DIR/cbom.exit" &
+
+        echo "Gitleaks, SBOM and CBOM generate started in background — CodeQL will run in parallel."
 
     # 8 -----------------------------------------------------------------------
     - name: Resolve CodeQL languages
@@ -894,8 +888,8 @@ runs:
         upload-database: false
         output: ${{ env.DC_SARIF_OUTPUT }}
 
-    # 10b — Wait for background jobs (Gitleaks + SBOM) -----------------------
-    - name: Wait for Gitleaks and SBOM generate
+    # 10b — Wait for background jobs (Gitleaks + SBOM + CBOM) ---------------
+    - name: Wait for Gitleaks, SBOM and CBOM generate
       shell: bash
       env:
         DC_SCAN_TIMEOUT: ${{ inputs.scan-timeout }}
@@ -903,12 +897,12 @@ runs:
         set -euo pipefail
 
         WORK_DIR="${DC_BG_WORK_DIR}"
-        echo "Waiting for background jobs (Gitleaks + SBOM generate) to complete..."
+        echo "Waiting for background jobs (Gitleaks + SBOM + CBOM generate) to complete..."
 
         timeout="${DC_SCAN_TIMEOUT:-600}"
         elapsed=0
         while true; do
-          [ -f "$WORK_DIR/gitleaks.exit" ] && [ -f "$WORK_DIR/sbom.exit" ] && break
+          [ -f "$WORK_DIR/gitleaks.exit" ] && [ -f "$WORK_DIR/sbom.exit" ] && [ -f "$WORK_DIR/cbom.exit" ] && break
           if [ "$elapsed" -ge "$timeout" ]; then
             echo "Timeout: background jobs did not finish within ${timeout}s." >&2
             exit 1
@@ -921,10 +915,13 @@ runs:
         cat "$WORK_DIR/gitleaks.log" || true
         echo "----- sbom generate -----"
         cat "$WORK_DIR/sbom.log" || true
+        echo "----- cbom generate -----"
+        cat "$WORK_DIR/cbom.log" || true
 
         rc=0
         [ "$(cat "$WORK_DIR/gitleaks.exit")" = "0" ] || { echo "Gitleaks scan failed." >&2; rc=1; }
         [ "$(cat "$WORK_DIR/sbom.exit")"    = "0" ] || { echo "SBOM generate failed." >&2; rc=1; }
+        [ "$(cat "$WORK_DIR/cbom.exit")"    = "0" ] || { echo "CBOM generate failed." >&2; rc=1; }
         exit $rc
 
     # 10c — Package SARIFs ----------------------------------------------------
@@ -959,8 +956,8 @@ runs:
           echo "Gitleaks SARIF (${DC_GITLEAKS_SARIF_OUTPUT}) not found; skipping its scan upload." >&2
         fi
 
-    # 11 — Upload scans + SBOM ------------------------------------------------
-    - name: Upload scans and SBOM (sequential)
+    # 11 — Upload scans + SBOM + CBOM -----------------------------------------
+    - name: Upload scans, SBOM and CBOM (sequential)
       if: always()
       shell: bash
       run: |
@@ -1014,7 +1011,8 @@ runs:
         if [ ! -f "${DC_SBOM_OUTPUT}" ]; then
           echo "No SBOM file found; skipping."
         else
-          if smctl sbom upload \
+          if smctl attest upload \
+            --type sbom \
             --file "${DC_SBOM_OUTPUT}" \
             --release-id "${DC_RELEASE_ID}" \
             --commit-sha "${DC_COMMIT_SHA:-}" \
@@ -1026,9 +1024,27 @@ runs:
           fi
         fi
 
+        # 4 — CBOM
+        echo "--- Upload: CBOM ---"
+        if [ ! -f "${DC_CBOM_OUTPUT}" ]; then
+          echo "No CBOM file found; skipping."
+        else
+          if smctl attest upload \
+            --type cbom \
+            --file "${DC_CBOM_OUTPUT}" \
+            --release-id "${DC_RELEASE_ID}" \
+            --commit-sha "${DC_COMMIT_SHA:-}" \
+            --ref-branch "${DC_REF_NAME:-}"; then
+            echo "CBOM upload: OK"
+          else
+            echo "CBOM upload: FAILED" >&2
+            rc=1
+          fi
+        fi
+
         if [ "$rc" -ne 0 ]; then
           echo "One or more uploads failed." >&2
           exit 1
         fi
 
-        echo "All scans and SBOM uploaded to release ${DC_RELEASE_ID}."
+        echo "All scans, SBOM and CBOM uploaded to release ${DC_RELEASE_ID}."
