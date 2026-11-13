@@ -44,6 +44,101 @@ module.exports = { exportEnv, addPath, run, xargs };
 
 /***/ }),
 
+/***/ 650:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+
+
+const fs = __nccwpck_require__(24);
+const https = __nccwpck_require__(708);
+const path = __nccwpck_require__(760);
+const { pipeline } = __nccwpck_require__(466);
+
+function httpsUrl(value) {
+  if (typeof value !== 'string' || !/^https:\/\//i.test(value) || /[\x00-\x20\x7f\\]/.test(value)) throw new Error('External artifact URL must be a valid HTTPS URL.');
+  let url;
+  try { url = new URL(value); } catch { throw new Error('External artifact URL must be a valid HTTPS URL.'); }
+  if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) {
+    throw new Error('External artifact URL must use HTTPS and must not contain credentials.');
+  }
+  return url.href;
+}
+
+function parseExternal(raw, skipSbom, skipSarif) {
+  let values;
+  try { values = JSON.parse(raw || '[]'); } catch { throw new Error('external-paths must be a JSON array of SCANNER_TYPE:URL strings.'); }
+  if (!Array.isArray(values)) throw new Error('external-paths must be a JSON array of SCANNER_TYPE:URL strings.');
+  const entries = [];
+  for (const value of values) {
+    if (typeof value !== 'string') throw new Error('Each external-paths entry must be a SCANNER_TYPE:URL string.');
+    const separator = value.indexOf(':');
+    const type = value.slice(0, separator).trim().toUpperCase();
+    if (separator <= 0 || !/^[A-Z][A-Z0-9_]*$/.test(type)) throw new Error('Each external-paths entry must have a valid scanner type and URL.');
+    if ((type === 'SBOM' && skipSbom) || (type !== 'SBOM' && skipSarif)) continue;
+    entries.push({ type, url: httpsUrl(value.slice(separator + 1)) });
+  }
+  return entries;
+}
+
+function request(url, index) {
+  return new Promise((resolve, reject) => {
+    const operation = https.get(url, { signal: AbortSignal.timeout(120000) }, resolve);
+    operation.on('error', () => reject(new Error(`External artifact ${index} download failed.`)));
+  });
+}
+
+function redirectUrl(location, current, origin, index) {
+  let next;
+  try { next = httpsUrl(new URL(location, current).href); } catch { throw new Error(`External artifact ${index} has an invalid redirect.`); }
+  if (new URL(next).origin !== origin) throw new Error(`External artifact ${index} redirects to a different origin.`);
+  return next;
+}
+
+async function downloadFile(entry, destination, index) {
+  const origin = new URL(entry.url).origin;
+  let url = entry.url;
+  for (let redirects = 0; redirects <= 5; redirects++) {
+    const response = await request(url, index);
+    const status = response.statusCode || 0;
+    if ([301, 302, 303, 307, 308].includes(status)) {
+      response.resume();
+      if (!response.headers.location || redirects === 5) throw new Error(`External artifact ${index} has an invalid redirect.`);
+      url = redirectUrl(response.headers.location, url, origin, index);
+      continue;
+    }
+    if (status < 200 || status >= 300) {
+      response.resume();
+      throw new Error(`External artifact ${index} download failed (HTTP ${status}).`);
+    }
+    try { await pipeline(response, fs.createWriteStream(destination, { flags: 'wx', mode: 0o600 })); }
+    catch { throw new Error(`External artifact ${index} download failed.`); }
+    if (fs.statSync(destination).size === 0) throw new Error(`External artifact ${index} is empty.`);
+    return;
+  }
+}
+
+async function downloadExternal(entries, runnerTemp) {
+  if (!entries.length) return [];
+  const directory = fs.mkdtempSync(path.join(runnerTemp, 'dc-external-'));
+  const files = [];
+  try {
+    for (const [index, entry] of entries.entries()) {
+      const file = path.join(directory, `${index + 1}-${entry.type}${entry.type === 'SBOM' ? '.json' : '.zip'}`);
+      await downloadFile(entry, file, index + 1);
+      files.push({ type: entry.type, file });
+      console.log(`Downloaded external ${entry.type} artifact ${index + 1}.`);
+    }
+    return files;
+  } catch (error) {
+    fs.rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+module.exports = { httpsUrl, parseExternal, downloadExternal };
+
+/***/ }),
+
 /***/ 712:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -152,11 +247,14 @@ function runLogged(command, args, log, options = {}) {
   return result;
 }
 
-function startScans() {
-  const env = process.env;
-  const work = path.join(env.RUNNER_TEMP, 'dc-bg-jobs');
-  fs.mkdirSync(work, { recursive: true });
-  exportEnv('DC_BG_WORK_DIR', work);
+function scanJobs(env) {
+  const jobs = [];
+  if (env.DC_RUN_GITLEAKS === 'true') jobs.push('gitleaks');
+  if (env.DC_RUN_SBOM === 'true') jobs.push('sbom');
+  return jobs;
+}
+
+function runGitleaks(env, work) {
   const gitleaksLog = path.join(work, 'gitleaks.log');
   fs.writeFileSync(gitleaksLog, '');
   const scanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-scan-'));
@@ -177,15 +275,26 @@ function startScans() {
     fs.rmSync(path.dirname(archive), { recursive: true, force: true });
   }
   fs.writeFileSync(path.join(work, 'gitleaks.exit'), '0\n');
-  const sbomLog = path.join(work, 'sbom.log');
-  fs.writeFileSync(sbomLog, '');
-  runLogged('smctl', ['sbom', 'generate', '--path', '.', '--output', env.DC_SBOM_OUTPUT, '--spec-version', env.DC_INPUT_SBOM_SPEC], sbomLog, { cwd: env.GITHUB_WORKSPACE });
-  fs.writeFileSync(path.join(work, 'sbom.exit'), '0\n');
-  console.log('Gitleaks and SBOM generation completed.');
+}
+
+function startScans() {
+  const env = process.env;
+  const work = path.join(env.RUNNER_TEMP, 'dc-bg-jobs');
+  fs.mkdirSync(work, { recursive: true });
+  exportEnv('DC_BG_WORK_DIR', work);
+  if (env.DC_RUN_GITLEAKS === 'true') runGitleaks(env, work);
+  if (env.DC_RUN_SBOM === 'true') {
+    const sbomLog = path.join(work, 'sbom.log');
+    fs.writeFileSync(sbomLog, '');
+    runLogged('smctl', ['sbom', 'generate', '--path', '.', '--output', env.DC_SBOM_OUTPUT, '--spec-version', env.DC_INPUT_SBOM_SPEC], sbomLog, { cwd: env.GITHUB_WORKSPACE });
+    fs.writeFileSync(path.join(work, 'sbom.exit'), '0\n');
+  }
+  console.log('Requested scans and SBOM generation completed.');
 }
 
 function resolveLanguages() {
   const env = process.env;
+  if (env.DC_RUN_CODEQL !== 'true') return;
   const priority = xargs((env.DC_INPUT_CODEQL_BUILD_MODE || 'none').toLowerCase());
   if (!['none', 'autobuild'].includes(priority)) throw new Error(`Invalid codeql-build-mode: '${priority}' (use none or autobuild).`);
   let languages = env.DC_INPUT_LANGUAGES || '';
@@ -217,16 +326,17 @@ function resolveLanguages() {
 
 async function waitScans() {
   const work = process.env.DC_BG_WORK_DIR;
+  const jobs = scanJobs(process.env);
   const timeout = Number(process.env.DC_SCAN_TIMEOUT || '600');
   if (!Number.isInteger(timeout)) throw new Error('Invalid scan-timeout.');
   let elapsed = 0;
-  while (!fs.existsSync(path.join(work, 'gitleaks.exit')) || !fs.existsSync(path.join(work, 'sbom.exit'))) {
+  while (jobs.some((name) => !fs.existsSync(path.join(work, `${name}.exit`)))) {
     if (elapsed >= timeout) throw new Error(`Timeout: background jobs did not finish within ${timeout}s.`);
     await new Promise((resolve) => setTimeout(resolve, 5000));
     elapsed += 5;
   }
   let failed = false;
-  for (const name of ['gitleaks', 'sbom']) {
+  for (const name of jobs) {
     console.log(`----- ${name === 'sbom' ? 'sbom generate' : name} -----`);
     const log = path.join(work, `${name}.log`);
     if (fs.existsSync(log)) process.stdout.write(fs.readFileSync(log, 'utf8'));
@@ -248,38 +358,74 @@ function sarifFiles(directory) {
   return files.sort();
 }
 
+function externalFile(input, label) {
+  const file = path.resolve(process.env.GITHUB_WORKSPACE, input);
+  try {
+    if (!fs.statSync(file).isFile()) throw new Error('not a regular file');
+    fs.accessSync(file, fs.constants.R_OK);
+  } catch {
+    throw new Error(`${label} is not a readable file: ${file}`);
+  }
+  return file;
+}
+
 function packageSarifs() {
   const env = process.env;
-  const codeql = env.DC_SARIF_OUTPUT;
-  const files = fs.existsSync(codeql) ? (fs.statSync(codeql).isDirectory() ? sarifFiles(codeql) : [codeql]) : [];
-  if (files.length) {
-    const result = run('zip', ['-j', env.DC_CODEQL_SCAN_ZIP, ...files]);
-    process.stdout.write(result.stdout || '');
-  } else console.error(`CodeQL SARIF (${codeql}) not found or empty; skipping CodeQL scan upload.`);
-  if (fs.existsSync(env.DC_GITLEAKS_SARIF_OUTPUT)) {
-    const result = run('zip', ['-j', env.DC_GITLEAKS_SCAN_ZIP, env.DC_GITLEAKS_SARIF_OUTPUT]);
-    process.stdout.write(result.stdout || '');
-  } else console.error(`Gitleaks SARIF (${env.DC_GITLEAKS_SARIF_OUTPUT}) not found; skipping its scan upload.`);
+  if (env.DC_RUN_CODEQL === 'true') {
+    const codeql = env.DC_SARIF_OUTPUT;
+    const files = fs.existsSync(codeql) ? (fs.statSync(codeql).isDirectory() ? sarifFiles(codeql) : [codeql]) : [];
+    if (files.length) {
+      const result = run('zip', ['-j', env.DC_CODEQL_SCAN_ZIP, ...files]);
+      process.stdout.write(result.stdout || '');
+    } else console.error(`CodeQL SARIF (${codeql}) not found or empty; skipping CodeQL scan upload.`);
+  }
+  if (env.DC_RUN_GITLEAKS === 'true') {
+    if (fs.existsSync(env.DC_GITLEAKS_SARIF_OUTPUT)) {
+      const result = run('zip', ['-j', env.DC_GITLEAKS_SCAN_ZIP, env.DC_GITLEAKS_SARIF_OUTPUT]);
+      process.stdout.write(result.stdout || '');
+    } else console.error(`Gitleaks SARIF (${env.DC_GITLEAKS_SARIF_OUTPUT}) not found; skipping its scan upload.`);
+  }
+}
+
+function uploadTargets(env) {
+  const targets = [];
+  const addSarif = (name, file, scanner, required) => targets.push({ name, file, required, args: ['scan', 'upload', '--file', file, '--release-id', env.DC_RELEASE_ID, '--scanner-type', scanner, '--ref-branch', env.DC_REF_NAME || '', '--commit-sha', env.DC_COMMIT_SHA || ''] });
+  const external = JSON.parse(env.DC_EXTERNAL_ARTIFACTS || '[]');
+  const addSbom = (file, required) => targets.push({ name: 'SBOM', file, required, args: ['sbom', 'upload', '--file', file, '--release-id', env.DC_RELEASE_ID, '--commit-sha', env.DC_COMMIT_SHA || '', '--ref-branch', env.DC_REF_NAME || ''] });
+  if (env.DC_RUN_CODEQL === 'true') addSarif('CodeQL SARIF', env.DC_CODEQL_SCAN_ZIP, 'CODEQL', false);
+  if (env.DC_RUN_GITLEAKS === 'true') addSarif('Gitleaks SARIF', env.DC_GITLEAKS_SCAN_ZIP, 'GITLEAKS', false);
+  if (env.DC_SKIP_SARIF !== 'true') {
+    for (const artifact of external.filter((item) => item.type !== 'SBOM')) addSarif(`External ${artifact.type} SARIF`, artifact.file, artifact.type, true);
+  }
+  if (env.DC_RUN_SBOM === 'true') addSbom(env.DC_SBOM_OUTPUT, false);
+  if (env.DC_SKIP_SBOM !== 'true') {
+    for (const artifact of external.filter((item) => item.type === 'SBOM')) addSbom(artifact.file, true);
+  }
+  return targets;
+}
+
+function uploadTarget({ name, file, args, required }) {
+  console.log(`--- Upload: ${name} ---`);
+  if (required) {
+    try { externalFile(file || '', name); } catch (error) { console.error(error.message); return false; }
+  } else if (!fs.existsSync(file)) { console.log(`No ${name} file found; skipping.`); return true; }
+  const result = run('smctl', args, { allowFailure: true });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.status !== 0) { console.error(`${name} upload: FAILED`); return false; }
+  console.log(`${name} upload: OK`);
+  return true;
 }
 
 function upload() {
   const env = process.env;
-  if (!env.DC_RELEASE_ID) throw new Error('No RELEASE_ID available; cannot upload.');
-  const targets = [
-    ['CodeQL SARIF', env.DC_CODEQL_SCAN_ZIP, ['scan', 'upload', '--file', env.DC_CODEQL_SCAN_ZIP, '--release-id', env.DC_RELEASE_ID, '--scanner-type', 'CODEQL', '--ref-branch', env.DC_REF_NAME || '', '--commit-sha', env.DC_COMMIT_SHA || '']],
-    ['Gitleaks SARIF', env.DC_GITLEAKS_SCAN_ZIP, ['scan', 'upload', '--file', env.DC_GITLEAKS_SCAN_ZIP, '--release-id', env.DC_RELEASE_ID, '--scanner-type', 'GITLEAKS', '--ref-branch', env.DC_REF_NAME || '', '--commit-sha', env.DC_COMMIT_SHA || '']],
-    ['SBOM', env.DC_SBOM_OUTPUT, ['sbom', 'upload', '--file', env.DC_SBOM_OUTPUT, '--release-id', env.DC_RELEASE_ID, '--commit-sha', env.DC_COMMIT_SHA || '', '--ref-branch', env.DC_REF_NAME || '']],
-  ];
-  let failed = false;
-  for (const [name, file, args] of targets) {
-    console.log(`--- Upload: ${name} ---`);
-    if (!fs.existsSync(file)) { console.log(`No ${name} file found; skipping.`); continue; }
-    const result = run('smctl', args, { allowFailure: true });
-    if (result.stdout) process.stdout.write(result.stdout);
-    if (result.stderr) process.stderr.write(result.stderr);
-    if (result.status !== 0) { console.error(`${name} upload: FAILED`); failed = true; }
-    else console.log(`${name} upload: OK`);
+  if (env.DC_SKIP_SARIF === 'true' && env.DC_SKIP_SBOM === 'true') {
+    console.log('SARIF and SBOM uploads skipped.');
+    return;
   }
+  if (!env.DC_RELEASE_ID) throw new Error('No RELEASE_ID available; cannot upload.');
+  const results = uploadTargets(env).map(uploadTarget);
+  const failed = results.some((result) => !result);
   if (failed) throw new Error('One or more uploads failed.');
   console.log(`All scans and SBOM uploaded to release ${env.DC_RELEASE_ID}.`);
 }
@@ -294,12 +440,22 @@ module.exports = { startScans, resolveLanguages, waitScans, packageSarifs, uploa
 
 
 const { exportEnv, xargs } = __nccwpck_require__(128);
+const { parseExternal, downloadExternal } = __nccwpck_require__(650);
 
 function rejectControls(value, name) {
   if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`Invalid ${name}: contains control characters.`);
 }
 
-function normalizeInputs() {
+function artifactInputs(env) {
+  const skipSbom = (env.RAW_SKIP_SBOM || 'false').trim().toLowerCase();
+  const skipSarif = (env.RAW_SKIP_SARIF || 'false').trim().toLowerCase();
+  if (!['true', 'false'].includes(skipSbom)) throw new Error("Invalid skip-sbom input (use true|false).");
+  if (!['true', 'false'].includes(skipSarif)) throw new Error("Invalid skip-sarif input (use true|false).");
+  const entries = parseExternal(env.RAW_EXTERNAL_PATHS, skipSbom === 'true', skipSarif === 'true');
+  return { skipSbom, skipSarif, entries };
+}
+
+async function normalizeInputs() {
   const env = process.env;
   let host = xargs(env.RAW_HOST || '');
   if (!host) throw new Error("Input 'host' is required.");
@@ -317,18 +473,23 @@ function normalizeInputs() {
     ['COMMIT_SHA', 'commit-sha'], ['BRANCH', 'branch'],
   ];
   for (const [field, name] of fields) rejectControls(env[`RAW_${field}`] || '', name);
-  const languages = (env.RAW_LANGUAGES || '').toLowerCase().replace(/[\t\n\v\f\r ]/g, '');
+  const { skipSbom, skipSarif, entries } = artifactInputs(env);
+  const hasCodeql = entries.some((entry) => entry.type === 'CODEQL');
+  const hasGitleaks = entries.some((entry) => entry.type === 'GITLEAKS');
+  const hasSbom = entries.some((entry) => entry.type === 'SBOM');
+  const languages = skipSarif === 'true' || hasCodeql ? '' : (env.RAW_LANGUAGES || '').toLowerCase().replace(/[\t\n\v\f\r ]/g, '');
   const tokens = languages.split(',');
   if (tokens.at(-1) === '') tokens.pop();
   if (languages && tokens.some((language) => !/^[a-z-]{1,32}$/.test(language))) {
     throw new Error('Invalid language identifier (use [a-z-]{1,32}, comma-separated).');
   }
-  const spec = xargs(env.RAW_SBOM_SPEC || '1.6');
+  const spec = skipSbom === 'true' || hasSbom ? '1.6' : xargs(env.RAW_SBOM_SPEC || '1.6');
   if (!['1.5', '1.6'].includes(spec)) throw new Error(`Invalid sbom-spec-version: '${spec}' (use 1.5 or 1.6).`);
   let cdn = xargs(env.RAW_CDN || '');
   rejectControls(cdn, 'digicert-cdn');
   if (!cdn.startsWith('https://')) throw new Error(`Invalid digicert-cdn: '${cdn}' must use HTTPS.`);
   cdn = cdn.replace(/\/$/, '');
+  const externalFiles = await downloadExternal(entries, env.RUNNER_TEMP);
 
   exportEnv('DC_INPUT_HOST', host);
   exportEnv('DC_INPUT_WITH_RELEASE', withRelease);
@@ -336,6 +497,13 @@ function normalizeInputs() {
   exportEnv('DC_INPUT_CDN', cdn);
   for (const [field] of fields) exportEnv(`DC_INPUT_${field}`, env[`RAW_${field}`] || '');
   exportEnv('DC_INPUT_LANGUAGES', languages);
+  exportEnv('DC_SKIP_SBOM', skipSbom);
+  exportEnv('DC_SKIP_SARIF', skipSarif);
+  // An external file of a type replaces its generation; skip disables it entirely.
+  exportEnv('DC_RUN_CODEQL', String(skipSarif !== 'true' && !hasCodeql));
+  exportEnv('DC_RUN_GITLEAKS', String(skipSarif !== 'true' && !hasGitleaks));
+  exportEnv('DC_RUN_SBOM', String(skipSbom !== 'true' && !hasSbom));
+  exportEnv('DC_EXTERNAL_ARTIFACTS', JSON.stringify(externalFiles));
 }
 
 function exportAuth() {
@@ -455,6 +623,7 @@ async function downloadSmctl() {
 
 function downloadGitleaks() {
   const env = process.env;
+  if (env.DC_RUN_GITLEAKS !== 'true') return;
   const file = path.join(env.DC_GITLEAKS_BIN_DIR, 'gitleaks');
   if (executable(file)) return console.log(`gitleaks ${env.DC_GITLEAKS_VERSION} found in tool cache @ ${env.DC_GITLEAKS_BIN_DIR}`);
   const version = env.DC_GITLEAKS_VERSION;
@@ -478,7 +647,11 @@ function downloadGitleaks() {
 }
 
 function addTools() {
-  for (const [directory, name, args] of [[process.env.DC_SMCTL_BIN_DIR, 'smctl', ['--version']], [process.env.DC_GITLEAKS_BIN_DIR, 'gitleaks', ['version']]]) {
+  const tools = [[process.env.DC_SMCTL_BIN_DIR, 'smctl', ['--version']]];
+  if (process.env.DC_RUN_GITLEAKS === 'true') {
+    tools.push([process.env.DC_GITLEAKS_BIN_DIR, 'gitleaks', ['version']]);
+  }
+  for (const [directory, name, args] of tools) {
     addPath(directory);
     const file = path.join(directory, name);
     console.log(`${name}: ${file}`);
@@ -514,6 +687,13 @@ module.exports = require("node:fs");
 
 /***/ }),
 
+/***/ 708:
+/***/ ((module) => {
+
+module.exports = require("node:https");
+
+/***/ }),
+
 /***/ 161:
 /***/ ((module) => {
 
@@ -525,6 +705,13 @@ module.exports = require("node:os");
 /***/ ((module) => {
 
 module.exports = require("node:path");
+
+/***/ }),
+
+/***/ 466:
+/***/ ((module) => {
+
+module.exports = require("node:stream/promises");
 
 /***/ })
 

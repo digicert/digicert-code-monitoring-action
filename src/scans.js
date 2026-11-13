@@ -17,11 +17,14 @@ function runLogged(command, args, log, options = {}) {
   return result;
 }
 
-function startScans() {
-  const env = process.env;
-  const work = path.join(env.RUNNER_TEMP, 'dc-bg-jobs');
-  fs.mkdirSync(work, { recursive: true });
-  exportEnv('DC_BG_WORK_DIR', work);
+function scanJobs(env) {
+  const jobs = [];
+  if (env.DC_RUN_GITLEAKS === 'true') jobs.push('gitleaks');
+  if (env.DC_RUN_SBOM === 'true') jobs.push('sbom');
+  return jobs;
+}
+
+function runGitleaks(env, work) {
   const gitleaksLog = path.join(work, 'gitleaks.log');
   fs.writeFileSync(gitleaksLog, '');
   const scanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-scan-'));
@@ -42,15 +45,26 @@ function startScans() {
     fs.rmSync(path.dirname(archive), { recursive: true, force: true });
   }
   fs.writeFileSync(path.join(work, 'gitleaks.exit'), '0\n');
-  const sbomLog = path.join(work, 'sbom.log');
-  fs.writeFileSync(sbomLog, '');
-  runLogged('smctl', ['sbom', 'generate', '--path', '.', '--output', env.DC_SBOM_OUTPUT, '--spec-version', env.DC_INPUT_SBOM_SPEC], sbomLog, { cwd: env.GITHUB_WORKSPACE });
-  fs.writeFileSync(path.join(work, 'sbom.exit'), '0\n');
-  console.log('Gitleaks and SBOM generation completed.');
+}
+
+function startScans() {
+  const env = process.env;
+  const work = path.join(env.RUNNER_TEMP, 'dc-bg-jobs');
+  fs.mkdirSync(work, { recursive: true });
+  exportEnv('DC_BG_WORK_DIR', work);
+  if (env.DC_RUN_GITLEAKS === 'true') runGitleaks(env, work);
+  if (env.DC_RUN_SBOM === 'true') {
+    const sbomLog = path.join(work, 'sbom.log');
+    fs.writeFileSync(sbomLog, '');
+    runLogged('smctl', ['sbom', 'generate', '--path', '.', '--output', env.DC_SBOM_OUTPUT, '--spec-version', env.DC_INPUT_SBOM_SPEC], sbomLog, { cwd: env.GITHUB_WORKSPACE });
+    fs.writeFileSync(path.join(work, 'sbom.exit'), '0\n');
+  }
+  console.log('Requested scans and SBOM generation completed.');
 }
 
 function resolveLanguages() {
   const env = process.env;
+  if (env.DC_RUN_CODEQL !== 'true') return;
   const priority = xargs((env.DC_INPUT_CODEQL_BUILD_MODE || 'none').toLowerCase());
   if (!['none', 'autobuild'].includes(priority)) throw new Error(`Invalid codeql-build-mode: '${priority}' (use none or autobuild).`);
   let languages = env.DC_INPUT_LANGUAGES || '';
@@ -82,16 +96,17 @@ function resolveLanguages() {
 
 async function waitScans() {
   const work = process.env.DC_BG_WORK_DIR;
+  const jobs = scanJobs(process.env);
   const timeout = Number(process.env.DC_SCAN_TIMEOUT || '600');
   if (!Number.isInteger(timeout)) throw new Error('Invalid scan-timeout.');
   let elapsed = 0;
-  while (!fs.existsSync(path.join(work, 'gitleaks.exit')) || !fs.existsSync(path.join(work, 'sbom.exit'))) {
+  while (jobs.some((name) => !fs.existsSync(path.join(work, `${name}.exit`)))) {
     if (elapsed >= timeout) throw new Error(`Timeout: background jobs did not finish within ${timeout}s.`);
     await new Promise((resolve) => setTimeout(resolve, 5000));
     elapsed += 5;
   }
   let failed = false;
-  for (const name of ['gitleaks', 'sbom']) {
+  for (const name of jobs) {
     console.log(`----- ${name === 'sbom' ? 'sbom generate' : name} -----`);
     const log = path.join(work, `${name}.log`);
     if (fs.existsSync(log)) process.stdout.write(fs.readFileSync(log, 'utf8'));
@@ -113,38 +128,74 @@ function sarifFiles(directory) {
   return files.sort();
 }
 
+function externalFile(input, label) {
+  const file = path.resolve(process.env.GITHUB_WORKSPACE, input);
+  try {
+    if (!fs.statSync(file).isFile()) throw new Error('not a regular file');
+    fs.accessSync(file, fs.constants.R_OK);
+  } catch {
+    throw new Error(`${label} is not a readable file: ${file}`);
+  }
+  return file;
+}
+
 function packageSarifs() {
   const env = process.env;
-  const codeql = env.DC_SARIF_OUTPUT;
-  const files = fs.existsSync(codeql) ? (fs.statSync(codeql).isDirectory() ? sarifFiles(codeql) : [codeql]) : [];
-  if (files.length) {
-    const result = run('zip', ['-j', env.DC_CODEQL_SCAN_ZIP, ...files]);
-    process.stdout.write(result.stdout || '');
-  } else console.error(`CodeQL SARIF (${codeql}) not found or empty; skipping CodeQL scan upload.`);
-  if (fs.existsSync(env.DC_GITLEAKS_SARIF_OUTPUT)) {
-    const result = run('zip', ['-j', env.DC_GITLEAKS_SCAN_ZIP, env.DC_GITLEAKS_SARIF_OUTPUT]);
-    process.stdout.write(result.stdout || '');
-  } else console.error(`Gitleaks SARIF (${env.DC_GITLEAKS_SARIF_OUTPUT}) not found; skipping its scan upload.`);
+  if (env.DC_RUN_CODEQL === 'true') {
+    const codeql = env.DC_SARIF_OUTPUT;
+    const files = fs.existsSync(codeql) ? (fs.statSync(codeql).isDirectory() ? sarifFiles(codeql) : [codeql]) : [];
+    if (files.length) {
+      const result = run('zip', ['-j', env.DC_CODEQL_SCAN_ZIP, ...files]);
+      process.stdout.write(result.stdout || '');
+    } else console.error(`CodeQL SARIF (${codeql}) not found or empty; skipping CodeQL scan upload.`);
+  }
+  if (env.DC_RUN_GITLEAKS === 'true') {
+    if (fs.existsSync(env.DC_GITLEAKS_SARIF_OUTPUT)) {
+      const result = run('zip', ['-j', env.DC_GITLEAKS_SCAN_ZIP, env.DC_GITLEAKS_SARIF_OUTPUT]);
+      process.stdout.write(result.stdout || '');
+    } else console.error(`Gitleaks SARIF (${env.DC_GITLEAKS_SARIF_OUTPUT}) not found; skipping its scan upload.`);
+  }
+}
+
+function uploadTargets(env) {
+  const targets = [];
+  const addSarif = (name, file, scanner, required) => targets.push({ name, file, required, args: ['scan', 'upload', '--file', file, '--release-id', env.DC_RELEASE_ID, '--scanner-type', scanner, '--ref-branch', env.DC_REF_NAME || '', '--commit-sha', env.DC_COMMIT_SHA || ''] });
+  const external = JSON.parse(env.DC_EXTERNAL_ARTIFACTS || '[]');
+  const addSbom = (file, required) => targets.push({ name: 'SBOM', file, required, args: ['sbom', 'upload', '--file', file, '--release-id', env.DC_RELEASE_ID, '--commit-sha', env.DC_COMMIT_SHA || '', '--ref-branch', env.DC_REF_NAME || ''] });
+  if (env.DC_RUN_CODEQL === 'true') addSarif('CodeQL SARIF', env.DC_CODEQL_SCAN_ZIP, 'CODEQL', false);
+  if (env.DC_RUN_GITLEAKS === 'true') addSarif('Gitleaks SARIF', env.DC_GITLEAKS_SCAN_ZIP, 'GITLEAKS', false);
+  if (env.DC_SKIP_SARIF !== 'true') {
+    for (const artifact of external.filter((item) => item.type !== 'SBOM')) addSarif(`External ${artifact.type} SARIF`, artifact.file, artifact.type, true);
+  }
+  if (env.DC_RUN_SBOM === 'true') addSbom(env.DC_SBOM_OUTPUT, false);
+  if (env.DC_SKIP_SBOM !== 'true') {
+    for (const artifact of external.filter((item) => item.type === 'SBOM')) addSbom(artifact.file, true);
+  }
+  return targets;
+}
+
+function uploadTarget({ name, file, args, required }) {
+  console.log(`--- Upload: ${name} ---`);
+  if (required) {
+    try { externalFile(file || '', name); } catch (error) { console.error(error.message); return false; }
+  } else if (!fs.existsSync(file)) { console.log(`No ${name} file found; skipping.`); return true; }
+  const result = run('smctl', args, { allowFailure: true });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.status !== 0) { console.error(`${name} upload: FAILED`); return false; }
+  console.log(`${name} upload: OK`);
+  return true;
 }
 
 function upload() {
   const env = process.env;
-  if (!env.DC_RELEASE_ID) throw new Error('No RELEASE_ID available; cannot upload.');
-  const targets = [
-    ['CodeQL SARIF', env.DC_CODEQL_SCAN_ZIP, ['scan', 'upload', '--file', env.DC_CODEQL_SCAN_ZIP, '--release-id', env.DC_RELEASE_ID, '--scanner-type', 'CODEQL', '--ref-branch', env.DC_REF_NAME || '', '--commit-sha', env.DC_COMMIT_SHA || '']],
-    ['Gitleaks SARIF', env.DC_GITLEAKS_SCAN_ZIP, ['scan', 'upload', '--file', env.DC_GITLEAKS_SCAN_ZIP, '--release-id', env.DC_RELEASE_ID, '--scanner-type', 'GITLEAKS', '--ref-branch', env.DC_REF_NAME || '', '--commit-sha', env.DC_COMMIT_SHA || '']],
-    ['SBOM', env.DC_SBOM_OUTPUT, ['sbom', 'upload', '--file', env.DC_SBOM_OUTPUT, '--release-id', env.DC_RELEASE_ID, '--commit-sha', env.DC_COMMIT_SHA || '', '--ref-branch', env.DC_REF_NAME || '']],
-  ];
-  let failed = false;
-  for (const [name, file, args] of targets) {
-    console.log(`--- Upload: ${name} ---`);
-    if (!fs.existsSync(file)) { console.log(`No ${name} file found; skipping.`); continue; }
-    const result = run('smctl', args, { allowFailure: true });
-    if (result.stdout) process.stdout.write(result.stdout);
-    if (result.stderr) process.stderr.write(result.stderr);
-    if (result.status !== 0) { console.error(`${name} upload: FAILED`); failed = true; }
-    else console.log(`${name} upload: OK`);
+  if (env.DC_SKIP_SARIF === 'true' && env.DC_SKIP_SBOM === 'true') {
+    console.log('SARIF and SBOM uploads skipped.');
+    return;
   }
+  if (!env.DC_RELEASE_ID) throw new Error('No RELEASE_ID available; cannot upload.');
+  const results = uploadTargets(env).map(uploadTarget);
+  const failed = results.some((result) => !result);
   if (failed) throw new Error('One or more uploads failed.');
   console.log(`All scans and SBOM uploaded to release ${env.DC_RELEASE_ID}.`);
 }

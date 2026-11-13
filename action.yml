@@ -87,6 +87,21 @@ inputs:
     required: false
     default: "1.6"
 
+  skip-sbom:
+    description: "Skip SBOM generation and upload, including external SBOM files."
+    required: false
+    default: "false"
+
+  skip-sarif:
+    description: "Skip CodeQL and Gitleaks scans and all SARIF uploads, including external files."
+    required: false
+    default: "false"
+
+  external-paths:
+    description: 'JSON array of SCANNER_TYPE:HTTPS_URL entries, for example ["CODEQL:https://example.com/report.zip", "SBOM:https://example.com/sbom.json"]. URLs must provide upload-ready files; redirects must remain on the same origin. Pass signed URLs through secrets.'
+    required: false
+    default: "[]"
+
   use-github-caching-service:
     description: "Cache downloaded tools (smctl, gitleaks) across runs. When false, tools download every run."
     required: false
@@ -129,6 +144,7 @@ runs:
 
     # 2 -----------------------------------------------------------------------
     - name: Sanitize and normalize action inputs
+      id: normalize_inputs
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
@@ -143,6 +159,9 @@ runs:
         RAW_LANGUAGES: ${{ inputs.languages }}
         RAW_SBOM_SPEC: ${{ inputs.sbom-spec-version }}
         RAW_CDN: ${{ inputs.digicert-cdn }}
+        RAW_SKIP_SBOM: ${{ inputs.skip-sbom }}
+        RAW_SKIP_SARIF: ${{ inputs.skip-sarif }}
+        RAW_EXTERNAL_PATHS: ${{ inputs.external-paths }}
       run: node "$ACTION_DIR/dist/index.js" normalize-inputs
     # 3 -----------------------------------------------------------------------
     - name: Export smctl auth
@@ -188,7 +207,7 @@ runs:
 
     - name: Restore gitleaks from cache
       id: gitleaks_cache
-      if: ${{ inputs.use-github-caching-service == 'true' }}
+      if: ${{ inputs.use-github-caching-service == 'true' && env.DC_RUN_GITLEAKS == 'true' }}
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ env.DC_GITLEAKS_TOOL_CACHE_ROOT }}
@@ -235,7 +254,7 @@ runs:
         DC_INPUT_CODEQL_BUILD_MODE: ${{ inputs.codeql-build-mode }}
       run: node "$ACTION_DIR/dist/index.js" resolve-languages
     - name: Initialize CodeQL
-      if: ${{ env.DC_LANGUAGES != '' }}
+      if: ${{ env.DC_RUN_CODEQL == 'true' && env.DC_LANGUAGES != '' }}
       uses: github/codeql-action/init@411bbbe57033eedfc1a82d68c01345aa96c737d7 # v4
       with:
         languages: ${{ env.DC_LANGUAGES }}
@@ -244,7 +263,7 @@ runs:
 
     # 9 -----------------------------------------------------------------------
     - name: Perform CodeQL Analysis
-      if: ${{ env.DC_LANGUAGES != '' }}
+      if: ${{ env.DC_RUN_CODEQL == 'true' && env.DC_LANGUAGES != '' }}
       uses: github/codeql-action/analyze@411bbbe57033eedfc1a82d68c01345aa96c737d7 # v4
       with:
         upload: false
@@ -260,14 +279,14 @@ runs:
       run: node "$ACTION_DIR/dist/index.js" wait-scans
     # 10c — Package SARIFs ----------------------------------------------------
     - name: Package each SARIF independently
-      if: always()
+      if: ${{ always() && steps.normalize_inputs.outcome == 'success' }}
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
       run: node "$ACTION_DIR/dist/index.js" package-sarifs
     # 11 — Upload scans + SBOM ------------------------------------------------
     - name: Upload scans and SBOM (sequential)
-      if: always()
+      if: ${{ always() && steps.normalize_inputs.outcome == 'success' }}
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}

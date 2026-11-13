@@ -89,6 +89,18 @@ test('uses cached smctl without downloading', () => {
   } finally { data.cleanup(); }
 });
 
+test('does not add or run Gitleaks when external SARIF is supplied', () => {
+  const data = fixture();
+  try {
+    const pathFile = path.join(data.directory, 'github-path');
+    fs.writeFileSync(pathFile, '');
+    const result = data.execute('add-tools', { GITHUB_PATH: pathFile, DC_SMCTL_BIN_DIR: data.directory, DC_GITLEAKS_BIN_DIR: path.join(data.directory, 'missing-gitleaks'), DC_RUN_GITLEAKS: 'false' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(pathFile, 'utf8'), `${data.directory}\n`);
+    assert.deepEqual(result.calls.map((call) => call[0]), ['smctl']);
+  } finally { data.cleanup(); }
+});
+
 test('downloads and verifies the Gitleaks archive', () => {
   const data = fixture();
   try {
@@ -102,7 +114,7 @@ test('downloads and verifies the Gitleaks archive', () => {
     const checksumFile = path.join(data.directory, 'checksums.txt');
     fs.writeFileSync(checksumFile, `${digest}  gitleaks_8.18.4_linux_x64.tar.gz\n`);
     const bin = path.join(data.directory, 'gitleaks-bin');
-    const result = data.execute('download-gitleaks', { DC_GITLEAKS_BIN_DIR: bin, DC_GITLEAKS_VERSION: '8.18.4', DOWNLOAD_SOURCE: archive, DOWNLOAD_CHECKSUM: checksumFile });
+    const result = data.execute('download-gitleaks', { DC_RUN_GITLEAKS: 'true', DC_GITLEAKS_BIN_DIR: bin, DC_GITLEAKS_VERSION: '8.18.4', DOWNLOAD_SOURCE: archive, DOWNLOAD_CHECKSUM: checksumFile });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.readFileSync(path.join(bin, 'gitleaks'), 'utf8'), 'test binary');
     assert.notEqual(fs.statSync(path.join(bin, 'gitleaks')).mode & 0o111, 0);

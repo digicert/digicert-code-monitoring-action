@@ -80,6 +80,7 @@ async function downloadSmctl() {
 
 function downloadGitleaks() {
   const env = process.env;
+  if (env.DC_RUN_GITLEAKS !== 'true') return;
   const file = path.join(env.DC_GITLEAKS_BIN_DIR, 'gitleaks');
   if (executable(file)) return console.log(`gitleaks ${env.DC_GITLEAKS_VERSION} found in tool cache @ ${env.DC_GITLEAKS_BIN_DIR}`);
   const version = env.DC_GITLEAKS_VERSION;
@@ -103,7 +104,11 @@ function downloadGitleaks() {
 }
 
 function addTools() {
-  for (const [directory, name, args] of [[process.env.DC_SMCTL_BIN_DIR, 'smctl', ['--version']], [process.env.DC_GITLEAKS_BIN_DIR, 'gitleaks', ['version']]]) {
+  const tools = [[process.env.DC_SMCTL_BIN_DIR, 'smctl', ['--version']]];
+  if (process.env.DC_RUN_GITLEAKS === 'true') {
+    tools.push([process.env.DC_GITLEAKS_BIN_DIR, 'gitleaks', ['version']]);
+  }
+  for (const [directory, name, args] of tools) {
     addPath(directory);
     const file = path.join(directory, name);
     console.log(`${name}: ${file}`);

@@ -1,12 +1,22 @@
 'use strict';
 
 const { exportEnv, xargs } = require('./common');
+const { parseExternal, downloadExternal } = require('./external');
 
 function rejectControls(value, name) {
   if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`Invalid ${name}: contains control characters.`);
 }
 
-function normalizeInputs() {
+function artifactInputs(env) {
+  const skipSbom = (env.RAW_SKIP_SBOM || 'false').trim().toLowerCase();
+  const skipSarif = (env.RAW_SKIP_SARIF || 'false').trim().toLowerCase();
+  if (!['true', 'false'].includes(skipSbom)) throw new Error("Invalid skip-sbom input (use true|false).");
+  if (!['true', 'false'].includes(skipSarif)) throw new Error("Invalid skip-sarif input (use true|false).");
+  const entries = parseExternal(env.RAW_EXTERNAL_PATHS, skipSbom === 'true', skipSarif === 'true');
+  return { skipSbom, skipSarif, entries };
+}
+
+async function normalizeInputs() {
   const env = process.env;
   let host = xargs(env.RAW_HOST || '');
   if (!host) throw new Error("Input 'host' is required.");
@@ -24,18 +34,23 @@ function normalizeInputs() {
     ['COMMIT_SHA', 'commit-sha'], ['BRANCH', 'branch'],
   ];
   for (const [field, name] of fields) rejectControls(env[`RAW_${field}`] || '', name);
-  const languages = (env.RAW_LANGUAGES || '').toLowerCase().replace(/[\t\n\v\f\r ]/g, '');
+  const { skipSbom, skipSarif, entries } = artifactInputs(env);
+  const hasCodeql = entries.some((entry) => entry.type === 'CODEQL');
+  const hasGitleaks = entries.some((entry) => entry.type === 'GITLEAKS');
+  const hasSbom = entries.some((entry) => entry.type === 'SBOM');
+  const languages = skipSarif === 'true' || hasCodeql ? '' : (env.RAW_LANGUAGES || '').toLowerCase().replace(/[\t\n\v\f\r ]/g, '');
   const tokens = languages.split(',');
   if (tokens.at(-1) === '') tokens.pop();
   if (languages && tokens.some((language) => !/^[a-z-]{1,32}$/.test(language))) {
     throw new Error('Invalid language identifier (use [a-z-]{1,32}, comma-separated).');
   }
-  const spec = xargs(env.RAW_SBOM_SPEC || '1.6');
+  const spec = skipSbom === 'true' || hasSbom ? '1.6' : xargs(env.RAW_SBOM_SPEC || '1.6');
   if (!['1.5', '1.6'].includes(spec)) throw new Error(`Invalid sbom-spec-version: '${spec}' (use 1.5 or 1.6).`);
   let cdn = xargs(env.RAW_CDN || '');
   rejectControls(cdn, 'digicert-cdn');
   if (!cdn.startsWith('https://')) throw new Error(`Invalid digicert-cdn: '${cdn}' must use HTTPS.`);
   cdn = cdn.replace(/\/$/, '');
+  const externalFiles = await downloadExternal(entries, env.RUNNER_TEMP);
 
   exportEnv('DC_INPUT_HOST', host);
   exportEnv('DC_INPUT_WITH_RELEASE', withRelease);
@@ -43,6 +58,13 @@ function normalizeInputs() {
   exportEnv('DC_INPUT_CDN', cdn);
   for (const [field] of fields) exportEnv(`DC_INPUT_${field}`, env[`RAW_${field}`] || '');
   exportEnv('DC_INPUT_LANGUAGES', languages);
+  exportEnv('DC_SKIP_SBOM', skipSbom);
+  exportEnv('DC_SKIP_SARIF', skipSarif);
+  // An external file of a type replaces its generation; skip disables it entirely.
+  exportEnv('DC_RUN_CODEQL', String(skipSarif !== 'true' && !hasCodeql));
+  exportEnv('DC_RUN_GITLEAKS', String(skipSarif !== 'true' && !hasGitleaks));
+  exportEnv('DC_RUN_SBOM', String(skipSbom !== 'true' && !hasSbom));
+  exportEnv('DC_EXTERNAL_ARTIFACTS', JSON.stringify(externalFiles));
 }
 
 function exportAuth() {
