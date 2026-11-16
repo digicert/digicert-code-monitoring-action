@@ -45,6 +45,11 @@ test('validates external artifact inputs and skip precedence', () => {
   assert.match(skipped.output, /DC_EXTERNAL_ARTIFACTS<<[^\n]+\n\[\]\n/);
   const unused = execute('normalize-inputs', { ...base, RAW_SKIP_SARIF: 'true', RAW_LANGUAGES: 'invalid!language', RAW_SKIP_SBOM: 'true', RAW_SBOM_SPEC: 'invalid' });
   assert.equal(unused.status, 0, unused.stderr);
+  const lines = execute('normalize-inputs', { ...base, RAW_SKIP_SARIF: 'true', RAW_EXTERNAL_PATHS: 'GITLEAKS:not-a-url\n\nCODEQL:also-not-a-url\n' });
+  assert.equal(lines.status, 0, lines.stderr);
+  assert.match(lines.output, /DC_EXTERNAL_ARTIFACTS<<[^\n]+\n\[\]\n/);
+  assert.equal(execute('normalize-inputs', { ...base, RAW_EXTERNAL_PATHS: 'SBOM:http://example.com/file\n' }).status, 1);
+  assert.equal(execute('normalize-inputs', { ...base, RAW_EXTERNAL_PATHS: 'bad entry' }).status, 1);
 });
 
 test('computes run flags from skip settings', () => {

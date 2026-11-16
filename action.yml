@@ -98,7 +98,7 @@ inputs:
     default: "false"
 
   external-paths:
-    description: 'JSON array of SCANNER_TYPE:HTTPS_URL entries, for example ["CODEQL:https://example.com/report.zip", "SBOM:https://example.com/sbom.json"]. URLs must provide upload-ready files; HTTPS redirects, including to other hosts, are followed up to 5 times. Files larger than 512 MiB are rejected. Pass signed URLs through secrets.'
+    description: 'External files to upload instead of generating them, one SCANNER_TYPE:HTTPS_URL per line (a JSON array of the same strings is also accepted), for example CODEQL:https://example.com/report.zip or SBOM:https://example.com/sbom.json. URLs must provide upload-ready files; HTTPS redirects, including to other hosts, are followed up to 5 times. Files larger than 512 MiB are rejected. Pass signed URLs through secrets.'
     required: false
     default: "[]"
 

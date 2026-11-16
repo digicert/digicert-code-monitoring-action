@@ -24,12 +24,19 @@ function httpsUrl(value) {
   return url.href;
 }
 
-function parseExternal(raw, skipSbom, skipSarif) {
+function entryList(raw) {
+  const text = (raw || '').trim();
+  if (!text) return [];
+  if (!/^[[{]/.test(text)) return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   let values;
-  try { values = JSON.parse(raw || '[]'); } catch { throw new Error('external-paths must be a JSON array of SCANNER_TYPE:URL strings.'); }
-  if (!Array.isArray(values)) throw new Error('external-paths must be a JSON array of SCANNER_TYPE:URL strings.');
+  try { values = JSON.parse(text); } catch { throw new Error('external-paths must be one SCANNER_TYPE:URL per line or a JSON array of such strings.'); }
+  if (!Array.isArray(values)) throw new Error('external-paths must be one SCANNER_TYPE:URL per line or a JSON array of such strings.');
+  return values;
+}
+
+function parseExternal(raw, skipSbom, skipSarif) {
   const entries = [];
-  for (const value of values) {
+  for (const value of entryList(raw)) {
     if (typeof value !== 'string') throw new Error('Each external-paths entry must be a SCANNER_TYPE:URL string.');
     const separator = value.indexOf(':');
     const type = value.slice(0, separator).trim().toUpperCase();

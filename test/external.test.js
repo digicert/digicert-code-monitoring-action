@@ -23,6 +23,22 @@ test('rejects invalid input without exposing URL secrets', () => {
   assert.throws(() => httpsUrl('file:///etc/passwd'));
 });
 
+test('accepts one entry per line, ignoring blank lines and CRLF', () => {
+  const raw = 'gitleaks:https://example.com/a.zip?token=value\r\n\r\n  SBOM:https://example.com/b.json  \n';
+  const entries = parseExternal(raw, false, false);
+  assert.deepEqual(entries.map((entry) => entry.type), ['GITLEAKS', 'SBOM']);
+  assert.equal(new URL(entries[0].url).searchParams.get('token'), 'value');
+  assert.deepEqual(parseExternal('\n  \n', false, false), []);
+});
+
+test('line format keeps skip handling and rejects bad lines without leaking URLs', () => {
+  assert.deepEqual(parseExternal('GITLEAKS:not-a-url\nSBOM:https://example.com/a.json', false, true).map((entry) => entry.type), ['SBOM']);
+  for (const raw of ['bad entry', 'CODEQL:http://example.com/?secret=hidden', 'SBOM:https://example.com/a.json\nnot valid']) {
+    assert.throws(() => parseExternal(raw, false, false), (error) => !/hidden/.test(error.message));
+  }
+  assert.throws(() => parseExternal('{}', false, false), /one SCANNER_TYPE:URL per line or a JSON array/);
+});
+
 test('ignores URLs for skipped artifact categories after validating structure', () => {
   const entries = parseExternal('["GITLEAKS:not-a-url","SBOM:https://example.com/a.json"]', false, true);
   assert.deepEqual(entries.map((entry) => entry.type), ['SBOM']);
