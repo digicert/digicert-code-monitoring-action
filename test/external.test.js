@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const https = require('node:https');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
@@ -62,7 +63,7 @@ test('downloads enabled files before exporting state, with secure redirect and f
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const base = `https://127.0.0.1:${server.address().port}`;
     const execute = async (entries, extra = {}) => {
-      const envFile = path.join(directory, `env-${Math.random()}`);
+      const envFile = path.join(directory, `env-${crypto.randomUUID()}`);
       fs.writeFileSync(envFile, '');
       const entry = path.join(__dirname, `../${process.env.NODE_ACTION_ENTRY === 'dist' ? 'dist' : 'src'}/index.js`);
       const child = spawn(process.execPath, [entry, 'normalize-inputs'], { env: { ...process.env, RAW_HOST: 'https://example.com', RAW_CDN: 'https://cdn.example', RAW_API_KEY: 'secret', RAW_EXTERNAL_PATHS: JSON.stringify(entries), RUNNER_TEMP: directory, GITHUB_ENV: envFile, NODE_EXTRA_CA_CERTS: cert, ...extra } });

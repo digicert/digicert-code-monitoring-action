@@ -1,8 +1,18 @@
 'use strict';
 
 const fs = require('node:fs');
+const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
+
+// Joins one file name onto an absolute base, rejecting separators and dot segments.
+function child(base, name) {
+  const segment = String(name);
+  if (!path.isAbsolute(base) || !segment || segment === '.' || segment === '..' || segment.includes(path.sep) || segment.includes('\0')) {
+    throw new Error('Invalid path segment.');
+  }
+  return path.join(base, segment);
+}
 
 function exportEnv(name, value) {
   const delimiter = `ghadelimiter_${crypto.randomUUID()}`;
@@ -33,4 +43,4 @@ function xargs(value) {
   return output;
 }
 
-module.exports = { exportEnv, addPath, run, xargs };
+module.exports = { exportEnv, addPath, run, xargs, child };

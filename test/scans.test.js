@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
+const { child } = require('../src/common');
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-scans-'));
@@ -36,7 +37,7 @@ const off = { DC_RUN_CODEQL: 'false', DC_RUN_GITLEAKS: 'false', DC_RUN_SBOM: 'fa
 
 function initializeGit(workspace) {
   for (const args of [['init', '-q'], ['config', 'user.email', 'test@example.invalid'], ['config', 'user.name', 'Test'], ['add', 'tracked.txt'], ['commit', '-qm', 'test']]) {
-    if (args[0] === 'add') fs.writeFileSync(path.join(workspace, 'tracked.txt'), 'content');
+    if (args[0] === 'add') fs.writeFileSync(child(workspace, 'tracked.txt'), 'content');
     const git = spawnSync('git', args, { cwd: workspace, encoding: 'utf8' });
     assert.equal(git.status, 0, git.stderr);
   }

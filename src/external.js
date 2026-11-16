@@ -5,6 +5,7 @@ const https = require('node:https');
 const path = require('node:path');
 const { pipeline } = require('node:stream/promises');
 const { Transform } = require('node:stream');
+const { child } = require('./common');
 
 const MAX_BYTES = 512 * 1024 * 1024;
 
@@ -79,11 +80,11 @@ async function downloadFile(entry, destination, index, maxBytes) {
 
 async function downloadExternal(entries, runnerTemp, maxBytes = MAX_BYTES) {
   if (!entries.length) return [];
-  const directory = fs.mkdtempSync(path.join(runnerTemp, 'dc-external-'));
+  const directory = fs.mkdtempSync(child(runnerTemp, 'dc-external-'));
   const files = [];
   try {
     for (const [index, entry] of entries.entries()) {
-      const file = path.join(directory, `${index + 1}-${entry.type}${entry.type === 'SBOM' ? '.json' : '.zip'}`);
+      const file = child(directory, `${index + 1}-${entry.type}${entry.type === 'SBOM' ? '.json' : '.zip'}`);
       mask(entry.url);
       await downloadFile(entry, file, index + 1, maxBytes);
       files.push({ type: entry.type, file });

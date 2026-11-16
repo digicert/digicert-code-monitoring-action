@@ -8,8 +8,18 @@
 
 
 const fs = __nccwpck_require__(24);
+const path = __nccwpck_require__(760);
 const crypto = __nccwpck_require__(598);
 const { spawnSync } = __nccwpck_require__(421);
+
+// Joins one file name onto an absolute base, rejecting separators and dot segments.
+function child(base, name) {
+  const segment = String(name);
+  if (!path.isAbsolute(base) || !segment || segment === '.' || segment === '..' || segment.includes(path.sep) || segment.includes('\0')) {
+    throw new Error('Invalid path segment.');
+  }
+  return path.join(base, segment);
+}
 
 function exportEnv(name, value) {
   const delimiter = `ghadelimiter_${crypto.randomUUID()}`;
@@ -40,7 +50,7 @@ function xargs(value) {
   return output;
 }
 
-module.exports = { exportEnv, addPath, run, xargs };
+module.exports = { exportEnv, addPath, run, xargs, child };
 
 /***/ }),
 
@@ -54,6 +64,7 @@ const https = __nccwpck_require__(708);
 const path = __nccwpck_require__(760);
 const { pipeline } = __nccwpck_require__(466);
 const { Transform } = __nccwpck_require__(75);
+const { child } = __nccwpck_require__(128);
 
 const MAX_BYTES = 512 * 1024 * 1024;
 
@@ -128,11 +139,11 @@ async function downloadFile(entry, destination, index, maxBytes) {
 
 async function downloadExternal(entries, runnerTemp, maxBytes = MAX_BYTES) {
   if (!entries.length) return [];
-  const directory = fs.mkdtempSync(path.join(runnerTemp, 'dc-external-'));
+  const directory = fs.mkdtempSync(child(runnerTemp, 'dc-external-'));
   const files = [];
   try {
     for (const [index, entry] of entries.entries()) {
-      const file = path.join(directory, `${index + 1}-${entry.type}${entry.type === 'SBOM' ? '.json' : '.zip'}`);
+      const file = child(directory, `${index + 1}-${entry.type}${entry.type === 'SBOM' ? '.json' : '.zip'}`);
       mask(entry.url);
       await downloadFile(entry, file, index + 1, maxBytes);
       files.push({ type: entry.type, file });
@@ -243,7 +254,7 @@ module.exports = { createRelease };
 const fs = __nccwpck_require__(24);
 const os = __nccwpck_require__(161);
 const path = __nccwpck_require__(760);
-const { exportEnv, run, xargs } = __nccwpck_require__(128);
+const { exportEnv, run, xargs, child } = __nccwpck_require__(128);
 
 function runLogged(command, args, log, options = {}) {
   const descriptor = fs.openSync(log, 'a');
@@ -265,17 +276,18 @@ function scanJobs(env) {
 }
 
 function runGitleaks(env, work) {
-  const gitleaksLog = path.join(work, 'gitleaks.log');
+  const gitleaksLog = child(work, 'gitleaks.log');
   fs.writeFileSync(gitleaksLog, '');
+  const report = child(env.GITHUB_WORKSPACE, env.DC_GITLEAKS_SARIF_OUTPUT);
   const scanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-scan-'));
   const archive = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dc-archive-')), 'source.tar');
   try {
     runLogged('git', ['archive', '--output', archive, 'HEAD'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE, env: { ...env, GIT_LFS_SKIP_SMUDGE: '1' } });
     runLogged('tar', ['-xf', archive, '-C', scanDir], gitleaksLog);
-    runLogged('gitleaks', ['detect', '--source', scanDir, '--report-format', 'sarif', '--report-path', env.DC_GITLEAKS_SARIF_OUTPUT, '--no-banner', '--redact', '--no-git'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE, ignoreFailure: true });
-    if (!fs.existsSync(path.resolve(env.GITHUB_WORKSPACE, env.DC_GITLEAKS_SARIF_OUTPUT))) throw new Error('Gitleaks did not produce a SARIF report.');
+    runLogged('gitleaks', ['detect', '--source', scanDir, '--report-format', 'sarif', '--report-path', report, '--no-banner', '--redact', '--no-git'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE, ignoreFailure: true });
+    if (!fs.existsSync(report)) throw new Error('Gitleaks did not produce a SARIF report.');
     let findings = 0;
-    try { findings = JSON.parse(fs.readFileSync(path.resolve(env.GITHUB_WORKSPACE, env.DC_GITLEAKS_SARIF_OUTPUT), 'utf8')).runs[0].results.length; } catch { findings = 0; }
+    try { findings = JSON.parse(fs.readFileSync(report, 'utf8')).runs[0].results.length; } catch { findings = 0; }
     fs.appendFileSync(gitleaksLog, `Gitleaks findings: ${findings}\n`);
   } catch (error) {
     fs.appendFileSync(gitleaksLog, `${error.message}\n`);
@@ -284,20 +296,20 @@ function runGitleaks(env, work) {
     fs.rmSync(scanDir, { recursive: true, force: true });
     fs.rmSync(path.dirname(archive), { recursive: true, force: true });
   }
-  fs.writeFileSync(path.join(work, 'gitleaks.exit'), '0\n');
+  fs.writeFileSync(child(work, 'gitleaks.exit'), '0\n');
 }
 
 function startScans() {
   const env = process.env;
-  const work = path.join(env.RUNNER_TEMP, 'dc-bg-jobs');
+  const work = child(env.RUNNER_TEMP, 'dc-bg-jobs');
   fs.mkdirSync(work, { recursive: true });
   exportEnv('DC_BG_WORK_DIR', work);
   if (env.DC_RUN_GITLEAKS === 'true') runGitleaks(env, work);
   if (env.DC_RUN_SBOM === 'true') {
-    const sbomLog = path.join(work, 'sbom.log');
+    const sbomLog = child(work, 'sbom.log');
     fs.writeFileSync(sbomLog, '');
     runLogged('smctl', ['sbom', 'generate', '--path', '.', '--output', env.DC_SBOM_OUTPUT, '--spec-version', env.DC_INPUT_SBOM_SPEC], sbomLog, { cwd: env.GITHUB_WORKSPACE });
-    fs.writeFileSync(path.join(work, 'sbom.exit'), '0\n');
+    fs.writeFileSync(child(work, 'sbom.exit'), '0\n');
   }
   console.log('Requested scans and SBOM generation completed.');
 }
@@ -340,7 +352,7 @@ async function waitScans() {
   const timeout = Number(process.env.DC_SCAN_TIMEOUT || '600');
   if (!Number.isInteger(timeout)) throw new Error('Invalid scan-timeout.');
   let elapsed = 0;
-  while (jobs.some((name) => !fs.existsSync(path.join(work, `${name}.exit`)))) {
+  while (jobs.some((name) => !fs.existsSync(child(work, `${name}.exit`)))) {
     if (elapsed >= timeout) throw new Error(`Timeout: background jobs did not finish within ${timeout}s.`);
     await new Promise((resolve) => setTimeout(resolve, 5000));
     elapsed += 5;
@@ -348,9 +360,9 @@ async function waitScans() {
   let failed = false;
   for (const name of jobs) {
     console.log(`----- ${name === 'sbom' ? 'sbom generate' : name} -----`);
-    const log = path.join(work, `${name}.log`);
+    const log = child(work, `${name}.log`);
     if (fs.existsSync(log)) process.stdout.write(fs.readFileSync(log, 'utf8'));
-    if (fs.readFileSync(path.join(work, `${name}.exit`), 'utf8').trim() !== '0') {
+    if (fs.readFileSync(child(work, `${name}.exit`), 'utf8').trim() !== '0') {
       console.error(`${name === 'sbom' ? 'SBOM generate' : 'Gitleaks scan'} failed.`);
       failed = true;
     }
@@ -361,22 +373,20 @@ async function waitScans() {
 function sarifFiles(directory) {
   const files = [];
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    const file = path.join(directory, entry.name);
+    const file = child(directory, entry.name);
     if (entry.isDirectory()) files.push(...sarifFiles(file));
     else if (entry.isFile() && entry.name.endsWith('.sarif')) files.push(file);
   }
   return files.sort();
 }
 
-function externalFile(input, label) {
-  const file = path.resolve(process.env.GITHUB_WORKSPACE, input);
+function externalFile(file, label) {
   try {
-    if (!fs.statSync(file).isFile()) throw new Error('not a regular file');
+    if (!path.isAbsolute(file) || !fs.statSync(file).isFile()) throw new Error('not a regular file');
     fs.accessSync(file, fs.constants.R_OK);
   } catch {
     throw new Error(`${label} is not a readable file: ${file}`);
   }
-  return file;
 }
 
 function packageSarifs() {
