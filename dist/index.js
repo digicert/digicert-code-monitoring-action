@@ -12,13 +12,14 @@ const path = __nccwpck_require__(760);
 const crypto = __nccwpck_require__(598);
 const { spawnSync } = __nccwpck_require__(421);
 
-// Joins one file name onto an absolute base, rejecting separators and dot segments.
+// Resolves one file name inside an absolute base, rejecting anything that escapes it.
 function child(base, name) {
   const segment = String(name);
-  if (!path.isAbsolute(base) || !segment || segment === '.' || segment === '..' || segment.includes(path.sep) || segment.includes('\0')) {
-    throw new Error('Invalid path segment.');
-  }
-  return path.join(base, segment);
+  if (!path.isAbsolute(base) || segment.includes('\0') || path.basename(segment) !== segment) throw new Error('Invalid path segment.');
+  const root = path.resolve(base);
+  const target = path.resolve(root, segment);
+  if (path.dirname(target) !== root) throw new Error('Invalid path segment.');
+  return target;
 }
 
 function exportEnv(name, value) {
