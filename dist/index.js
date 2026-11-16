@@ -53,6 +53,14 @@ const fs = __nccwpck_require__(24);
 const https = __nccwpck_require__(708);
 const path = __nccwpck_require__(760);
 const { pipeline } = __nccwpck_require__(466);
+const { Transform } = __nccwpck_require__(75);
+
+const MAX_BYTES = 512 * 1024 * 1024;
+
+// The URL itself is the credential, so hide it from logs before any request.
+function mask(url) {
+  process.stdout.write(`::add-mask::${url}\n`);
+}
 
 function httpsUrl(value) {
   if (typeof value !== 'string' || !/^https:\/\//i.test(value) || /[\x00-\x20\x7f\\]/.test(value)) throw new Error('External artifact URL must be a valid HTTPS URL.');
@@ -87,15 +95,11 @@ function request(url, index) {
   });
 }
 
-function redirectUrl(location, current, origin, index) {
-  let next;
-  try { next = httpsUrl(new URL(location, current).href); } catch { throw new Error(`External artifact ${index} has an invalid redirect.`); }
-  if (new URL(next).origin !== origin) throw new Error(`External artifact ${index} redirects to a different origin.`);
-  return next;
+function redirectUrl(location, current, index) {
+  try { return httpsUrl(new URL(location, current).href); } catch { throw new Error(`External artifact ${index} has an invalid redirect.`); }
 }
 
-async function downloadFile(entry, destination, index) {
-  const origin = new URL(entry.url).origin;
+async function downloadFile(entry, destination, index, maxBytes) {
   let url = entry.url;
   for (let redirects = 0; redirects <= 5; redirects++) {
     const response = await request(url, index);
@@ -103,28 +107,34 @@ async function downloadFile(entry, destination, index) {
     if ([301, 302, 303, 307, 308].includes(status)) {
       response.resume();
       if (!response.headers.location || redirects === 5) throw new Error(`External artifact ${index} has an invalid redirect.`);
-      url = redirectUrl(response.headers.location, url, origin, index);
+      url = redirectUrl(response.headers.location, url, index);
+      mask(url);
       continue;
     }
     if (status < 200 || status >= 300) {
       response.resume();
       throw new Error(`External artifact ${index} download failed (HTTP ${status}).`);
     }
-    try { await pipeline(response, fs.createWriteStream(destination, { flags: 'wx', mode: 0o600 })); }
-    catch { throw new Error(`External artifact ${index} download failed.`); }
+    const tooLarge = new Error(`External artifact ${index} exceeds the size limit.`);
+    if (Number(response.headers['content-length']) > maxBytes) { response.resume(); throw tooLarge; }
+    let size = 0;
+    const counter = new Transform({ transform(chunk, _encoding, callback) { size += chunk.length; callback(size > maxBytes ? tooLarge : null, chunk); } });
+    try { await pipeline(response, counter, fs.createWriteStream(destination, { flags: 'wx', mode: 0o600 })); }
+    catch (error) { throw error === tooLarge ? tooLarge : new Error(`External artifact ${index} download failed.`); }
     if (fs.statSync(destination).size === 0) throw new Error(`External artifact ${index} is empty.`);
     return;
   }
 }
 
-async function downloadExternal(entries, runnerTemp) {
+async function downloadExternal(entries, runnerTemp, maxBytes = MAX_BYTES) {
   if (!entries.length) return [];
   const directory = fs.mkdtempSync(path.join(runnerTemp, 'dc-external-'));
   const files = [];
   try {
     for (const [index, entry] of entries.entries()) {
       const file = path.join(directory, `${index + 1}-${entry.type}${entry.type === 'SBOM' ? '.json' : '.zip'}`);
-      await downloadFile(entry, file, index + 1);
+      mask(entry.url);
+      await downloadFile(entry, file, index + 1, maxBytes);
       files.push({ type: entry.type, file });
       console.log(`Downloaded external ${entry.type} artifact ${index + 1}.`);
     }
@@ -417,8 +427,15 @@ function uploadTarget({ name, file, args, required }) {
   return true;
 }
 
-function upload() {
-  const env = process.env;
+function removeExternal(env) {
+  for (const { file } of JSON.parse(env.DC_EXTERNAL_ARTIFACTS || '[]')) {
+    try { if (fs.lstatSync(file).isFile()) fs.unlinkSync(file); } catch { continue; }
+    const directory = path.dirname(file);
+    if (path.basename(directory).startsWith('dc-external-')) fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function uploadAll(env) {
   if (env.DC_SKIP_SARIF === 'true' && env.DC_SKIP_SBOM === 'true') {
     console.log('SARIF and SBOM uploads skipped.');
     return;
@@ -428,6 +445,10 @@ function upload() {
   const failed = results.some((result) => !result);
   if (failed) throw new Error('One or more uploads failed.');
   console.log(`All scans and SBOM uploaded to release ${env.DC_RELEASE_ID}.`);
+}
+
+function upload() {
+  try { uploadAll(process.env); } finally { removeExternal(process.env); }
 }
 
 module.exports = { startScans, resolveLanguages, waitScans, packageSarifs, upload };
@@ -705,6 +726,13 @@ module.exports = require("node:os");
 /***/ ((module) => {
 
 module.exports = require("node:path");
+
+/***/ }),
+
+/***/ 75:
+/***/ ((module) => {
+
+module.exports = require("node:stream");
 
 /***/ }),
 

@@ -187,8 +187,15 @@ function uploadTarget({ name, file, args, required }) {
   return true;
 }
 
-function upload() {
-  const env = process.env;
+function removeExternal(env) {
+  for (const { file } of JSON.parse(env.DC_EXTERNAL_ARTIFACTS || '[]')) {
+    try { if (fs.lstatSync(file).isFile()) fs.unlinkSync(file); } catch { continue; }
+    const directory = path.dirname(file);
+    if (path.basename(directory).startsWith('dc-external-')) fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function uploadAll(env) {
   if (env.DC_SKIP_SARIF === 'true' && env.DC_SKIP_SBOM === 'true') {
     console.log('SARIF and SBOM uploads skipped.');
     return;
@@ -198,6 +205,10 @@ function upload() {
   const failed = results.some((result) => !result);
   if (failed) throw new Error('One or more uploads failed.');
   console.log(`All scans and SBOM uploaded to release ${env.DC_RELEASE_ID}.`);
+}
+
+function upload() {
+  try { uploadAll(process.env); } finally { removeExternal(process.env); }
 }
 
 module.exports = { startScans, resolveLanguages, waitScans, packageSarifs, upload };

@@ -209,11 +209,27 @@ test('passes an existing SARIF ZIP through unchanged', () => {
     const settings = { DC_RUN_CODEQL: 'false', DC_RUN_SBOM: 'false', DC_SKIP_SBOM: 'true', DC_EXTERNAL_ARTIFACTS: JSON.stringify([{ type: 'CODEQL', file: zip }]) };
     const result = data.execute('package-sarifs', settings);
     assert.equal(result.status, 0, result.stderr);
+    assert.ok(fs.readFileSync(zip).equals(contents));
     const uploaded = data.execute('upload', settings);
     assert.equal(uploaded.status, 0, uploaded.stderr);
     assert.equal(uploaded.calls[0][uploaded.calls[0].indexOf('--file') + 1], zip);
-    assert.ok(fs.readFileSync(zip).equals(contents));
   } finally { data.cleanup(); }
+});
+
+test('removes downloaded external files after upload, even when an upload fails', () => {
+  for (const failing of [false, true]) {
+    const data = fixture();
+    try {
+      const directory = path.join(data.root, 'dc-external-test');
+      fs.mkdirSync(directory);
+      const external = [{ type: 'CODEQL', file: path.join(directory, '1-CODEQL.zip') }, { type: 'SBOM', file: path.join(directory, '2-SBOM.json') }];
+      for (const item of external) fs.writeFileSync(item.file, 'private report');
+      const result = data.execute('upload', { ...off, ...(failing ? { FAIL_CODEQL: 'true' } : {}), DC_EXTERNAL_ARTIFACTS: JSON.stringify(external) });
+      assert.equal(result.status, failing ? 1 : 0, result.stderr);
+      assert.equal(result.calls.length, 2);
+      assert.equal(fs.existsSync(directory), false);
+    } finally { data.cleanup(); }
+  }
 });
 
 test('skip controls prevent stale artifact uploads even when paths are present', () => {

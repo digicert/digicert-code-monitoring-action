@@ -32,18 +32,31 @@ test('ignores URLs for skipped artifact categories after validating structure', 
 test('downloads enabled files before exporting state, with secure redirect and failure handling', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-https-test-'));
   let server;
+  let other;
   try {
     const key = path.join(directory, 'key.pem');
     const cert = path.join(directory, 'cert.pem');
     const certificate = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'], { encoding: 'utf8' });
     assert.equal(certificate.status, 0, certificate.stderr);
     const requests = [];
-    server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFileSync(cert) }, (request, response) => {
+    const options = { key: fs.readFileSync(key), cert: fs.readFileSync(cert) };
+    let otherBase;
+    other = https.createServer(options, (request, response) => {
+      requests.push(request.url);
+      response.writeHead(200);
+      response.end('artifact bytes');
+    });
+    await new Promise((resolve) => other.listen(0, '127.0.0.1', resolve));
+    otherBase = `https://127.0.0.1:${other.address().port}`;
+    server = https.createServer(options, (request, response) => {
       requests.push(request.url);
       if (request.url.startsWith('/redirect')) { response.writeHead(302, { location: '/file' }); response.end(); }
-      else if (request.url.startsWith('/cross-origin')) { response.writeHead(302, { location: 'https://other.example/file?secret=hidden' }); response.end(); }
+      else if (request.url.startsWith('/cross-origin')) { response.writeHead(302, { location: `${otherBase}/file?secret=hidden` }); response.end(); }
+      else if (request.url.startsWith('/loop')) { response.writeHead(302, { location: '/loop' }); response.end(); }
       else if (request.url.startsWith('/downgrade')) { response.writeHead(302, { location: 'http://example.com/file' }); response.end(); }
       else if (request.url.startsWith('/failure')) { response.writeHead(404); response.end(); }
+      else if (request.url.startsWith('/declared')) { response.writeHead(200, { 'content-length': '20' }); response.end('x'.repeat(20)); }
+      else if (request.url.startsWith('/chunked')) { response.writeHead(200); response.write('x'.repeat(8)); response.write('x'.repeat(8)); response.end(); }
       else { response.writeHead(200); response.end('artifact bytes'); }
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -57,11 +70,15 @@ test('downloads enabled files before exporting state, with secure redirect and f
       child.stdout.on('data', (data) => { output += data; });
       child.stderr.on('data', (data) => { output += data; });
       const status = await new Promise((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
-      return { status, output, exported: fs.readFileSync(envFile, 'utf8') };
+      const lines = output.split('\n');
+      const masks = lines.filter((line) => line.startsWith('::add-mask::')).map((line) => line.slice('::add-mask::'.length));
+      return { status, output: lines.filter((line) => !line.startsWith('::add-mask::')).join('\n'), masks, exported: fs.readFileSync(envFile, 'utf8') };
     };
     const result = await execute([`GITLEAKS:${base}/redirect?token=hidden`, `SBOM:${base}/file`]);
     assert.equal(result.status, 0, result.output);
     assert.doesNotMatch(result.output + result.exported, /token=hidden/);
+    assert.ok(result.masks.includes(`${base}/redirect?token=hidden`));
+    assert.ok(result.masks.includes(`${base}/file`));
     const manifest = JSON.parse(/DC_EXTERNAL_ARTIFACTS<<[^\n]+\n([^\n]+)\n/.exec(result.exported)[1]);
     assert.deepEqual(manifest.map((item) => item.type), ['GITLEAKS', 'SBOM']);
     assert.equal(fs.readFileSync(manifest[0].file, 'utf8'), 'artifact bytes');
@@ -84,8 +101,29 @@ test('downloads enabled files before exporting state, with secure redirect and f
     assert.equal(failed.exported, '');
     assert.deepEqual(fs.readdirSync(directory).filter((name) => name.startsWith('dc-external-')), directories);
     const redirected = await execute([`CODEQL:${base}/cross-origin`]);
-    assert.equal(redirected.status, 1);
-    assert.match(redirected.output, /different origin/);
+    assert.equal(redirected.status, 0, redirected.output);
+    assert.doesNotMatch(redirected.output + redirected.exported, /secret=hidden/);
+    const crossed = JSON.parse(/DC_EXTERNAL_ARTIFACTS<<[^\n]+\n([^\n]+)\n/.exec(redirected.exported)[1]);
+    assert.equal(fs.readFileSync(crossed[0].file, 'utf8'), 'artifact bytes');
+    assert.ok(redirected.masks.includes(`${otherBase}/file?secret=hidden`));
+    const limited = async (route) => {
+      const child = spawn(process.execPath, ['-e', `require(${JSON.stringify(path.join(__dirname, '../src/external'))}).downloadExternal([{ type: 'SBOM', url: process.argv[1] }], process.argv[2], 10).catch((error) => { console.error(error.message); process.exit(1); })`, `${base}${route}?secret=hidden`, directory], { env: { ...process.env, NODE_EXTRA_CA_CERTS: cert } });
+      let stderr = '';
+      child.stderr.on('data', (data) => { stderr += data; });
+      const status = await new Promise((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+      return { status, stderr };
+    };
+    const before = fs.readdirSync(directory).filter((name) => name.startsWith('dc-external-'));
+    for (const route of ['/declared', '/chunked']) {
+      const oversized = await limited(route);
+      assert.equal(oversized.status, 1, route);
+      assert.match(oversized.stderr, /exceeds the size limit/, route);
+      assert.doesNotMatch(oversized.stderr, /secret=hidden/, route);
+    }
+    assert.deepEqual(fs.readdirSync(directory).filter((name) => name.startsWith('dc-external-')), before);
+    const looped = await execute([`CODEQL:${base}/loop`]);
+    assert.equal(looped.status, 1);
+    assert.match(looped.output, /invalid redirect/);
     const downgrade = await execute([`CODEQL:${base}/downgrade`]);
     assert.equal(downgrade.status, 1);
     assert.match(downgrade.output, /invalid redirect/);
@@ -103,6 +141,7 @@ test('downloads enabled files before exporting state, with secure redirect and f
     assert.equal(externalCodeql.status, 0, externalCodeql.output);
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
+    if (other) await new Promise((resolve) => other.close(resolve));
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
