@@ -15,20 +15,20 @@ inputs:
     required: true
 
   name:
-    description: "Scan/release name used to create the external release. Required when with-release is true."
+    description: "Scan/release name used to create the external release. Optional: when omitted it resolves to the repository name if with-release is true, otherwise to '<workflow>-<event>'."
     required: false
 
   with-release:
-    description: "When true, require name and tag and build the release name as '<name>-<tag>'; creates a RELEASED external release."
+    description: "When true, create a RELEASED external release named '<name>-<tag>' (name and tag are auto-resolved when omitted; see name and tag)."
     required: false
     default: "false"
 
   tag:
-    description: "Release tag used only when with-release is true (required when with-release is true)."
+    description: "Release tag used only when with-release is true. When omitted and the workflow was triggered by a tag push (refs/tags/<tag>), the tag is resolved from the ref; otherwise it is required when with-release is true."
     required: false
 
   dc-release-id:
-    description: "Optional pre-existing DCOne release ID. When provided, the action verifies it and reuses it instead of creating a new release."
+    description: "Optional pre-existing DCOne release ID. When provided, the action reuses it as-is for all uploads and skips release creation; it is NOT verified, so the caller must ensure it is valid."
     required: false
     default: ""
 
@@ -93,17 +93,17 @@ inputs:
     default: "true"
 
   use-binary-sha256-checksum:
-    description: "Key the smctl cache on the CDN smctl.sha256 so a new smctl build auto-invalidates the cache."
+    description: "Verify smctl (downloaded and cached) against the CDN smctl.sha256 and key the smctl cache on it, so a new smctl build auto-invalidates the cache. Fails the action if the checksum cannot be fetched or does not match; set to false only to explicitly accept unverified downloads."
     required: false
     default: "true"
 
   cache-version:
-    description: "Manual cache-busting key used for smctl when use-binary-sha256-checksum is false."
+    description: "Manual cache-busting key used for smctl when use-binary-sha256-checksum is false. Allowed characters: [A-Za-z0-9._-]."
     required: false
     default: "0.0.0-0"
 
   gitleaks-version:
-    description: "Gitleaks release version to download. Defaults to the action's pinned version; bump this to upgrade without waiting for an action release."
+    description: "Gitleaks release version (X.Y.Z) to download. Defaults to the action's pinned version; bump this to upgrade without waiting for an action release."
     required: false
     default: "8.18.4"
 
@@ -147,13 +147,18 @@ runs:
         RAW_LANGUAGES: ${{ inputs.languages }}
         RAW_SBOM_SPEC: ${{ inputs.sbom-spec-version }}
         RAW_CDN: ${{ inputs.digicert-cdn }}
+        RAW_USE_CHECKSUM: ${{ inputs.use-binary-sha256-checksum }}
+        RAW_CACHE_VERSION: ${{ inputs.cache-version }}
+        RAW_GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+        RAW_CODEQL_TOOLS_VERSION: ${{ inputs.codeql-tools-version }}
       run: |
         set -euo pipefail
 
         # Reject control characters (including CR/LF) to prevent shell/header injection.
+        # Compare against a tr-filtered copy: grep is line-based and never sees LF.
         reject_control_chars() {
           local value="$1"
-          if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+          if [ "$(printf '%s' "$value" | LC_ALL=C tr -d '[:cntrl:]')" != "$value" ]; then
             return 1
           fi
           return 0
@@ -263,11 +268,54 @@ runs:
         esac
         INPUT_CDN="${INPUT_CDN%/}"
 
+        # The values below are written to GITHUB_ENV and used in download URLs, cache
+        # keys and tool-cache paths, so reject control characters (grep matches per line,
+        # so a CR/LF could otherwise smuggle extra lines) and restrict them to a safe
+        # version-like charset.
+        is_safe_token() { # is_safe_token <value> <ERE>
+          reject_control_chars "$1" && printf '%s' "$1" | LC_ALL=C grep -Eq "$2"
+        }
+
+        INPUT_USE_CHECKSUM="$(printf '%s' "${RAW_USE_CHECKSUM:-true}" | tr '[:upper:]' '[:lower:]' | xargs)"
+        INPUT_USE_CHECKSUM="${INPUT_USE_CHECKSUM:-true}"
+        case "$INPUT_USE_CHECKSUM" in
+          true|false) ;;
+          *)
+            echo "Invalid use-binary-sha256-checksum: '$INPUT_USE_CHECKSUM' (use true|false)." >&2
+            exit 1
+            ;;
+        esac
+
+        INPUT_CACHE_VERSION="${RAW_CACHE_VERSION:-}"
+        INPUT_CACHE_VERSION="${INPUT_CACHE_VERSION:-0.0.0-0}"
+        if ! is_safe_token "$INPUT_CACHE_VERSION" '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
+          echo "Invalid cache-version: use 1-64 characters from [A-Za-z0-9._-], starting with an alphanumeric." >&2
+          exit 1
+        fi
+
+        INPUT_GITLEAKS_VERSION="${RAW_GITLEAKS_VERSION:-}"
+        INPUT_GITLEAKS_VERSION="${INPUT_GITLEAKS_VERSION:-8.18.4}"
+        if ! is_safe_token "$INPUT_GITLEAKS_VERSION" '^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$'; then
+          echo "Invalid gitleaks-version: use a plain X.Y.Z release version (e.g. 8.18.4)." >&2
+          exit 1
+        fi
+
+        INPUT_CODEQL_TOOLS_VERSION="${RAW_CODEQL_TOOLS_VERSION:-}"
+        if [ -n "$INPUT_CODEQL_TOOLS_VERSION" ] && \
+           ! is_safe_token "$INPUT_CODEQL_TOOLS_VERSION" '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
+          echo "Invalid codeql-tools-version: use a version such as 2.17.6 (1-64 characters from [A-Za-z0-9._-])." >&2
+          exit 1
+        fi
+
         {
           echo "DC_INPUT_HOST=$INPUT_HOST"
           echo "DC_INPUT_WITH_RELEASE=$INPUT_WITH_RELEASE"
           echo "DC_INPUT_SBOM_SPEC=$INPUT_SBOM_SPEC"
           echo "DC_INPUT_CDN=$INPUT_CDN"
+          echo "DC_INPUT_USE_CHECKSUM=$INPUT_USE_CHECKSUM"
+          echo "DC_INPUT_CACHE_VERSION=$INPUT_CACHE_VERSION"
+          echo "DC_GITLEAKS_VERSION=$INPUT_GITLEAKS_VERSION"
+          echo "DC_CODEQL_TOOLS_VERSION=$INPUT_CODEQL_TOOLS_VERSION"
           echo "DC_INPUT_NAME<<__DC_EOF__"
           echo "$INPUT_NAME"
           echo "__DC_EOF__"
@@ -315,8 +363,6 @@ runs:
     - name: Resolve repo context (owner/repo/ref)
       shell: bash
       env:
-        DC_GITLEAKS_VERSION_INPUT: ${{ inputs.gitleaks-version }}
-        DC_CODEQL_TOOLS_VERSION_INPUT: ${{ inputs.codeql-tools-version }}
         DC_INPUT_COMMIT_SHA: ${{ inputs.commit-sha }}
         DC_INPUT_BRANCH: ${{ inputs.branch }}
       run: |
@@ -363,24 +409,19 @@ runs:
           echo "__DC_EOF__"
         } >> "$GITHUB_ENV"
 
-        # Action constants (output filenames + tool versions).
+        # Action constants (output filenames). Tool versions are validated and exported in step 2.
         {
           echo "DC_SARIF_OUTPUT=$GITHUB_WORKSPACE/codeql.sarif"
           echo "DC_GITLEAKS_SARIF_OUTPUT=gitleaks.sarif"
           echo "DC_CODEQL_SCAN_ZIP=codeql-scan.zip"
           echo "DC_GITLEAKS_SCAN_ZIP=gitleaks-scan.zip"
           echo "DC_SBOM_OUTPUT=sbom.cdx.json"
-          echo "DC_GITLEAKS_VERSION=${DC_GITLEAKS_VERSION_INPUT:-8.18.4}"
-          echo "DC_CODEQL_TOOLS_VERSION=${DC_CODEQL_TOOLS_VERSION_INPUT:-}"
         } >> "$GITHUB_ENV"
 
     # 6 -----------------------------------------------------------------------
     - name: Compute tool cache keys
       id: cache_keys
       shell: bash
-      env:
-        DC_USE_CHECKSUM: ${{ inputs.use-binary-sha256-checksum }}
-        DC_CACHE_VERSION: ${{ inputs.cache-version }}
       run: |
         set -euo pipefail
 
@@ -407,42 +448,45 @@ runs:
           done
         }
 
-        USE_CHECKSUM="$(printf '%s' "${DC_USE_CHECKSUM:-true}" | tr '[:upper:]' '[:lower:]' | xargs)"
         SMCTL_SHA256=""
-        SMCTL_VERSION="0.0.0-${DC_CACHE_VERSION:-0.0.0-0}"
+        SMCTL_VERSION="0.0.0-${DC_INPUT_CACHE_VERSION}"
 
-        if [ "$USE_CHECKSUM" = "true" ]; then
-          # Fetch smctl.sha256 from CDN to use as the inner version identifier.
-          # A temp dir is fine here — this file is tiny and only used to compute paths.
+        if [ "${DC_INPUT_USE_CHECKSUM}" = "true" ]; then
+          # Fetch smctl.sha256 from CDN to use as the inner version identifier and the
+          # expected digest. Fail closed: without a valid digest smctl must not be run.
+          # Set use-binary-sha256-checksum: false to explicitly accept unverified downloads.
           TMP_SHA_DIR="$(mktemp -d)"
-          if fetch "${DC_INPUT_CDN}/smctl.sha256" "$TMP_SHA_DIR/smctl.sha256"; then
-            SHA256="$(awk '{print tolower($1)}' "$TMP_SHA_DIR/smctl.sha256" | head -n1)"
-            if printf '%s' "$SHA256" | LC_ALL=C grep -Eq '^[a-f0-9]{64}$'; then
-              SMCTL_SHA256="$SHA256"
-              SMCTL_VERSION="0.0.0-${SHA256}"
-            else
-              echo "Unexpected smctl.sha256 content; falling back to cache-version." >&2
-            fi
-          else
-            echo "Could not fetch smctl.sha256; falling back to cache-version." >&2
+          if ! fetch "${DC_INPUT_CDN}/smctl.sha256" "$TMP_SHA_DIR/smctl.sha256"; then
+            rm -rf "$TMP_SHA_DIR"
+            echo "SECURITY ERROR: could not fetch ${DC_INPUT_CDN}/smctl.sha256; refusing to run unverified smctl." >&2
+            echo "Set use-binary-sha256-checksum: false only if you accept that risk." >&2
+            exit 1
           fi
+          SHA256="$(awk '{print tolower($1)}' "$TMP_SHA_DIR/smctl.sha256" | head -n1)"
           rm -rf "$TMP_SHA_DIR"
+          if ! printf '%s' "$SHA256" | LC_ALL=C grep -Eq '^[a-f0-9]{64}$'; then
+            echo "SECURITY ERROR: unexpected smctl.sha256 content; refusing to run unverified smctl." >&2
+            echo "Set use-binary-sha256-checksum: false only if you accept that risk." >&2
+            exit 1
+          fi
+          SMCTL_SHA256="$SHA256"
+          SMCTL_VERSION="0.0.0-${SHA256}"
         fi
 
         # Versioned bin dirs — mirrors tc.cacheDir directory layout.
         SMCTL_BIN_DIR="${TOOL_CACHE}/smctl/${SMCTL_VERSION}/x64"
         GITLEAKS_BIN_DIR="${TOOL_CACHE}/gitleaks/${DC_GITLEAKS_VERSION}/x64"
 
-        # GitHub Actions cache paths are the tool root dirs (all versions under one key).
-        # Key uses cache-version (same as signing action) — sha256 lives in the inner dir,
-        # so a new smctl build auto-invalidates tc.find without changing the outer key.
+        # GitHub Actions cache keys include the tool version. For smctl that is the CDN
+        # sha256 (checksum mode) or cache-version, so a newly published smctl gets a new
+        # key and the refreshed binary can be saved instead of redownloaded every run.
         {
           echo "DC_SMCTL_BIN_DIR=$SMCTL_BIN_DIR"
           echo "DC_GITLEAKS_BIN_DIR=$GITLEAKS_BIN_DIR"
           echo "DC_SMCTL_TOOL_CACHE_ROOT=${TOOL_CACHE}/smctl"
           echo "DC_GITLEAKS_TOOL_CACHE_ROOT=${TOOL_CACHE}/gitleaks"
           echo "DC_SMCTL_SHA256=$SMCTL_SHA256"
-          echo "SMCTL_CACHE_KEY=smctl-${DC_CACHE_VERSION:-0.0.0-0}-linux-x64"
+          echo "SMCTL_CACHE_KEY=smctl-${SMCTL_VERSION}-linux-x64"
           echo "GITLEAKS_CACHE_KEY=gitleaks-${DC_GITLEAKS_VERSION}-linux-x64"
         } >> "$GITHUB_ENV"
 
@@ -467,13 +511,24 @@ runs:
       run: |
         set -euo pipefail
 
-        # Inner version check — mirrors tc.find(tool, version).
-        # GH cache may have restored the tool root but with a different sha256 version dir
-        # (e.g. cache-version unchanged but a new smctl was published). In that case the
-        # version dir won't exist and we fall through to download.
+        sha256_of() { sha256sum "$1" | awk '{print tolower($1)}'; }
+
+        # Inner version check — mirrors tc.find(tool, version). The version dir is
+        # derived from the CDN sha256 (or cache-version when checksum mode is off), so
+        # a newly published smctl uses a different dir and falls through to download.
+        # In checksum mode a cached binary is re-hashed so a corrupted or poisoned cache
+        # entry is never executed.
         if [ -x "${DC_SMCTL_BIN_DIR}/smctl" ]; then
-          echo "smctl found in tool cache @ ${DC_SMCTL_BIN_DIR}"
-          exit 0
+          if [ -z "${DC_SMCTL_SHA256}" ]; then
+            echo "smctl found in tool cache @ ${DC_SMCTL_BIN_DIR} (checksum verification disabled)"
+            exit 0
+          fi
+          if [ "$(sha256_of "${DC_SMCTL_BIN_DIR}/smctl")" = "${DC_SMCTL_SHA256}" ]; then
+            echo "smctl found in tool cache @ ${DC_SMCTL_BIN_DIR}; checksum verified."
+            exit 0
+          fi
+          echo "WARNING: cached smctl does not match the expected checksum; discarding and redownloading." >&2
+          rm -f "${DC_SMCTL_BIN_DIR}/smctl"
         fi
 
         fetch() {
@@ -497,11 +552,13 @@ runs:
         echo "Downloading smctl from ${DC_INPUT_CDN}/smctl"
         fetch "${DC_INPUT_CDN}/smctl" "${DC_SMCTL_BIN_DIR}/smctl"
 
-        # Verify checksum (fail closed) when we have one.
+        # Verify checksum (fail closed). DC_SMCTL_SHA256 is only empty when the caller
+        # explicitly disabled use-binary-sha256-checksum.
         if [ -n "${DC_SMCTL_SHA256}" ]; then
           echo "Verifying smctl SHA-256 checksum..."
-          ACTUAL="$(sha256sum "${DC_SMCTL_BIN_DIR}/smctl" | awk '{print tolower($1)}')"
+          ACTUAL="$(sha256_of "${DC_SMCTL_BIN_DIR}/smctl")"
           if [ "$ACTUAL" != "${DC_SMCTL_SHA256}" ]; then
+            rm -f "${DC_SMCTL_BIN_DIR}/smctl"
             echo "SECURITY ERROR: smctl checksum mismatch." >&2
             echo "Expected: ${DC_SMCTL_SHA256}" >&2
             echo "Actual:   ${ACTUAL}" >&2
@@ -509,7 +566,7 @@ runs:
           fi
           echo "smctl checksum verified."
         else
-          echo "WARNING: smctl checksum unavailable; skipping verification." >&2
+          echo "WARNING: use-binary-sha256-checksum is false; smctl checksum verification skipped." >&2
         fi
 
         chmod +x "${DC_SMCTL_BIN_DIR}/smctl"
@@ -691,12 +748,13 @@ runs:
           actor_id="$(printf '%s' "$actor_info"   | jq -r '.id // empty')"
           actor_node="$(printf '%s' "$actor_info" | jq -r '.node_id // empty')"
           run_suffix="${GITHUB_RUN_ID:-0}"
-          short_sha="${GITHUB_SHA:0:27}-${run_suffix:0:8}"
+          build_sha="${DC_COMMIT_SHA:-${GITHUB_SHA:-}}"
+          short_sha="${build_sha:0:27}-${run_suffix:0:8}"
           # smctl rejects --released-at for BUILD_ONLY, so it is intentionally omitted.
           args+=(
             --release-type BUILD_ONLY
-            --tag "${GITHUB_SHA:0:8}"
-            --release-url "https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA:-}"
+            --tag "${build_sha:0:8}"
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/commit/${build_sha}"
             --external-id "${GITHUB_RUN_ID:-0}"
             --external-global-id "${short_sha:-unknown}"
           )
@@ -745,11 +803,16 @@ runs:
           cd "${GITHUB_WORKSPACE}"
           scan_dir="$(mktemp -d)"
           GIT_LFS_SKIP_SMUDGE=1 git archive HEAD | tar -x -C "$scan_dir"
+          # Remove any stale report so only this run's output is uploaded.
+          rm -f "${DC_GITLEAKS_SARIF_OUTPUT}"
+          # --exit-code 0: findings are reported in the SARIF, not as a failure; real
+          # scanner errors still exit nonzero and fail this job.
           gitleaks detect \
             --source "$scan_dir" \
             --report-format sarif \
             --report-path "${DC_GITLEAKS_SARIF_OUTPUT}" \
-            --no-banner --redact --no-git || true
+            --exit-code 0 \
+            --no-banner --redact --no-git
           rm -rf "$scan_dir"
           if [ ! -f "${DC_GITLEAKS_SARIF_OUTPUT}" ]; then
             echo "Gitleaks did not produce a SARIF report." >&2
@@ -831,11 +894,19 @@ runs:
         fi
 
         # Otherwise resolve from GitHub's detected languages (Linguist) via gh.
+        # API failures are fatal: treating them as "no languages" would silently skip CodeQL.
         echo "Detecting languages via GitHub API: repos/${GITHUB_REPOSITORY}/languages"
-        RAW="$(gh api "repos/${GITHUB_REPOSITORY}/languages" --jq 'keys[]' 2>/dev/null || true)"
+        gh_rc=0
+        RAW="$(gh api "repos/${GITHUB_REPOSITORY}/languages" --jq 'keys[]' 2>"$RUNNER_TEMP/dc-gh-languages.err")" || gh_rc=$?
+        if [ "$gh_rc" -ne 0 ]; then
+          echo "Failed to detect repository languages via the GitHub API (exit $gh_rc):" >&2
+          cat "$RUNNER_TEMP/dc-gh-languages.err" >&2 || true
+          echo "Ensure github-token can read this repository, or set the 'languages' input explicitly." >&2
+          exit 1
+        fi
 
         if [ -z "$RAW" ]; then
-          echo "GitHub returned no languages; leaving empty for CodeQL autodetection fallback." >&2
+          echo "GitHub reported no languages for this repository; CodeQL analysis will be skipped." >&2
           emit_langs ""
           exit 0
         fi
@@ -856,9 +927,10 @@ runs:
             Python)                cq=python ;;
             Ruby)                  cq=ruby ;;
             Swift)                 cq=swift ;;
-            # C/C++ autobuild can't be guaranteed without a project build; skip in
-            # auto-detection (force via the languages input).
-            C|C++)                 cq=""; echo "Skipping $lang: requires a manual build; not auto-scanned." ;;
+            # C/C++ is not auto-scanned: this action has no manual-build hook, so results
+            # would rely on build-mode none (no traced build). An explicit 'c-cpp'
+            # languages override is analyzed with build-mode none.
+            C|C++)                 cq=""; echo "Skipping $lang: not auto-scanned (no traced build available)." ;;
             *)                     cq="" ;;   # not a CodeQL-supported language
           esac
           if [ -n "$cq" ] && [ -z "${seen[$cq]:-}" ]; then
@@ -868,7 +940,7 @@ runs:
         done <<< "$RAW"
 
         if [ "${#mapped[@]}" -eq 0 ]; then
-          echo "No CodeQL-supported languages detected; leaving empty for CodeQL autodetection fallback." >&2
+          echo "No CodeQL-supported languages detected; CodeQL analysis will be skipped." >&2
           emit_langs ""
           exit 0
         fi
