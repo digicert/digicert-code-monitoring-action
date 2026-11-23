@@ -117,6 +117,11 @@ inputs:
     required: false
     default: "600"
 
+  reachability:
+    description: "Experimental: extract a call graph from the CodeQL databases (javascript, python) and upload it to DigiCert so vulnerabilities can be marked reachable/unreachable. Never fails the run."
+    required: false
+    default: "false"
+
 runs:
   using: "composite"
   steps:
@@ -950,6 +955,7 @@ runs:
         emit_langs "$LANGS"
 
     - name: Initialize CodeQL
+      id: codeql-init
       if: ${{ env.DC_LANGUAGES != '' }}
       uses: github/codeql-action/init@411bbbe57033eedfc1a82d68c01345aa96c737d7 # v4
       with:
@@ -1104,3 +1110,13 @@ runs:
         fi
 
         echo "All scans and SBOM uploaded to release ${DC_RELEASE_ID}."
+
+    # 12 — Reachability call graph (experimental, best-effort) ---------------
+    - name: Upload reachability call graph
+      if: ${{ always() && inputs.reachability == 'true' && env.DC_LANGUAGES != '' && env.DC_RELEASE_ID != '' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        DC_CODEQL_PATH: ${{ steps.codeql-init.outputs.codeql-path }}
+        DC_REACHABILITY_DIR: ${{ github.action_path }}/reachability
+      run: bash "${DC_REACHABILITY_DIR}/upload.sh"

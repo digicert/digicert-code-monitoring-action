@@ -1,0 +1,5 @@
+name: digicert/stm-reachability-javascript
+version: 0.0.1
+library: false
+dependencies:
+  codeql/javascript-all: "*"
