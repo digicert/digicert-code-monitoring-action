@@ -53,7 +53,7 @@ Before you begin, review the following prerequisites:
 
 - Run scans on main and pull request (PR) pushes, or on a schedule.
 - Use `languages` to avoid unnecessary CodeQL language detection when the languages are known.
-- Auto-detection skips `C`/`C++` because they require a project-specific build; set `languages` explicitly (with a manual build) to scan them.
+- Auto-detection skips `C`/`C++` because this action has no manual-build step. An explicit `languages: c-cpp` override is analyzed with CodeQL build-mode `none` (no traced build); use a dedicated CodeQL workflow with a manual build if you need traced C/C++ analysis.
 - CodeQL runs a single build-mode per run. Repos with only build-free languages (js/ts, python, ruby, java, c#) use `none`; repos with only `go`/`swift` auto-use `autobuild`. For a repo that mixes both, `codeql-build-mode` picks which group to scan (default `none`).
 - Use `ubuntu-latest-xl` or another larger Linux x64 runner for large codebases.
 - Increase `scan-timeout` for repositories that need more time for Gitleaks and SBOM generation.
@@ -116,6 +116,8 @@ Use an existing workflow file or create a new one.
 | `with-release` | No | `false` | Link to a release version; creates a `RELEASED` release |
 | `tag` | No | | Auto-resolved from a tag-push ref when `with-release` is `true` and omitted; otherwise required |
 | `dc-release-id` | No | Empty | Optional pre-created DCOne release id; when provided the action reuses it directly and skips `smctl release create` (no verification call) |
+| `commit-sha` | No | Empty (triggering commit) | Commit SHA override used for checkout and as the commit for release creation, build-scan release metadata, and all uploads |
+| `branch` | No | Empty (triggering branch) | Branch override used for checkout (when `commit-sha` is not set) and as the source/ref branch for release creation and uploads |
 | `languages` | No | Empty | Comma-separated CodeQL language override |
 | `codeql-build-mode` | No | `none` | Preferred build-mode for mixed repos: `none` (js/ts, python, ruby, java, c#) or `autobuild` (go, swift). Single-group repos auto-select |
 | `github-token` | No | `${{ github.token }}` | Token for GitHub API calls |
@@ -126,9 +128,9 @@ Use an existing workflow file or create a new one.
 | `digicert-cdn` | No | DigiCert CDN | HTTPS URL for `smctl` |
 | `sbom-spec-version` | No | `1.6` | CycloneDX version: `1.5` or `1.6` |
 | `use-github-caching-service` | No | `true` | Cache `smctl` and Gitleaks |
-| `use-binary-sha256-checksum` | No | `true` | Verify and invalidate the `smctl` cache by checksum |
-| `cache-version` | No | `0.0.0-0` | Manual `smctl` cache-busting value |
-| `gitleaks-version` | No | `8.18.4` | Gitleaks version to download |
+| `use-binary-sha256-checksum` | No | `true` | Verify downloaded and cached `smctl` against the CDN checksum and key the cache on it; the action fails if the checksum is unavailable or mismatched. Set `false` only to explicitly accept unverified downloads |
+| `cache-version` | No | `0.0.0-0` | Manual `smctl` cache-busting value (`[A-Za-z0-9._-]`) |
+| `gitleaks-version` | No | `8.18.4` | Gitleaks version to download (`X.Y.Z`) |
 | `codeql-tools-version` | No | Empty | Optional CodeQL CLI bundle version |
 | `scan-timeout` | No | `600` | Maximum wait time for background scans, in seconds |
 
@@ -353,7 +355,9 @@ Example:
 | **`pull_request_target` rejected** | Unsafe event | Use `pull_request`, `push`, or `workflow_dispatch`. |
 | **Host must use HTTPS** | Invalid `host` value | Use the HTTPS DigiCert host URL, for example `https://one.digicert.com`. |
 | **Release metadata not found** | Tag is not a published GitHub release or token lacks access | Publish the release, grant `contents: read`, or provide all release metadata inputs. |
-| **Checksum mismatch** | Downloaded `smctl` does not match the CDN checksum | Retry and verify the DigiCert CDN; do not bypass the mismatch. |
+| **Checksum mismatch** | Downloaded or cached `smctl` does not match the CDN checksum | Retry and verify the DigiCert CDN; do not bypass the mismatch. |
+| **Could not fetch smctl.sha256** | CDN checksum file unavailable or malformed | Verify `digicert-cdn` and network access. Only set `use-binary-sha256-checksum: false` if you accept running an unverified binary. |
+| **Failed to detect repository languages** | `github-token` cannot read the repository or the GitHub API is unavailable | Grant `contents: read`, or set `languages` explicitly. |
 | **Background scan timeout** | Large repository or limited runner | Increase `scan-timeout` or use a larger Linux x64 runner. |
 | **Release creation failed** | Invalid credentials, host, or repository context | Check the DigiCert host, API key, permissions, and `smctl` output. |
 | **Upload failed** | Authentication, network, or release problem | Review the failing upload output and verify the release ID. |

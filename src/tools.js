@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { exportEnv, addPath, run, xargs } = require('./common');
+const { exportEnv, addPath, run } = require('./common');
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -26,23 +26,22 @@ function checksum(file) {
 async function cacheKeys() {
   const env = process.env;
   const cache = env.RUNNER_TOOL_CACHE || `${env.RUNNER_TEMP || '/tmp'}/tool-cache`;
-  const cacheVersion = env.DC_CACHE_VERSION || '0.0.0-0';
   let sha = '';
-  let version = `0.0.0-${cacheVersion}`;
-  if (xargs((env.DC_USE_CHECKSUM || 'true').toLowerCase()) === 'true') {
+  let version = `0.0.0-${env.DC_INPUT_CACHE_VERSION}`;
+  if (env.DC_INPUT_USE_CHECKSUM === 'true') {
+    // Fail closed: without a valid digest smctl must not be run.
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-sha-'));
     try {
       const file = path.join(temp, 'smctl.sha256');
-      await fetch(`${env.DC_INPUT_CDN}/smctl.sha256`, file, 60);
-      const candidate = (fs.readFileSync(file, 'utf8').trim().split(/\s+/)[0] || '').toLowerCase();
-      if (/^[a-f0-9]{64}$/.test(candidate)) {
-        sha = candidate;
-        version = `0.0.0-${sha}`;
-      } else {
-        console.error('Unexpected smctl.sha256 content; falling back to cache-version.');
+      try { await fetch(`${env.DC_INPUT_CDN}/smctl.sha256`, file, 60); } catch {
+        throw new Error(`SECURITY ERROR: could not fetch ${env.DC_INPUT_CDN}/smctl.sha256; refusing to run unverified smctl.\nSet use-binary-sha256-checksum: false only if you accept that risk.`);
       }
-    } catch (error) {
-      console.error(`Could not fetch smctl.sha256; falling back to cache-version. ${error.message}`);
+      const candidate = (fs.readFileSync(file, 'utf8').trim().split(/\s+/)[0] || '').toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(candidate)) {
+        throw new Error('SECURITY ERROR: unexpected smctl.sha256 content; refusing to run unverified smctl.\nSet use-binary-sha256-checksum: false only if you accept that risk.');
+      }
+      sha = candidate;
+      version = `0.0.0-${sha}`;
     } finally {
       fs.rmSync(temp, { recursive: true, force: true });
     }
@@ -53,7 +52,7 @@ async function cacheKeys() {
     DC_SMCTL_TOOL_CACHE_ROOT: `${cache}/smctl`,
     DC_GITLEAKS_TOOL_CACHE_ROOT: `${cache}/gitleaks`,
     DC_SMCTL_SHA256: sha,
-    SMCTL_CACHE_KEY: `smctl-${cacheVersion}-linux-x64`,
+    SMCTL_CACHE_KEY: `smctl-${version}-linux-x64`,
     GITLEAKS_CACHE_KEY: `gitleaks-${env.DC_GITLEAKS_VERSION}-linux-x64`,
   };
   for (const [name, value] of Object.entries(values)) exportEnv(name, value);
@@ -66,15 +65,24 @@ function executable(file) {
 async function downloadSmctl() {
   const env = process.env;
   const file = path.join(env.DC_SMCTL_BIN_DIR, 'smctl');
-  if (executable(file)) return console.log(`smctl found in tool cache @ ${env.DC_SMCTL_BIN_DIR}`);
+  // In checksum mode a cached binary is re-hashed so a corrupted or poisoned entry is never executed.
+  if (executable(file)) {
+    if (!env.DC_SMCTL_SHA256) return console.log(`smctl found in tool cache @ ${env.DC_SMCTL_BIN_DIR} (checksum verification disabled)`);
+    if (checksum(file) === env.DC_SMCTL_SHA256) return console.log(`smctl found in tool cache @ ${env.DC_SMCTL_BIN_DIR}; checksum verified.`);
+    console.error('WARNING: cached smctl does not match the expected checksum; discarding and redownloading.');
+    fs.rmSync(file, { force: true });
+  }
   fs.mkdirSync(env.DC_SMCTL_BIN_DIR, { recursive: true });
   console.log(`Downloading smctl from ${env.DC_INPUT_CDN}/smctl`);
   await fetch(`${env.DC_INPUT_CDN}/smctl`, file, 120);
   if (env.DC_SMCTL_SHA256) {
     const actual = checksum(file);
-    if (actual !== env.DC_SMCTL_SHA256) throw new Error(`SECURITY ERROR: smctl checksum mismatch.\nExpected: ${env.DC_SMCTL_SHA256}\nActual:   ${actual}`);
+    if (actual !== env.DC_SMCTL_SHA256) {
+      fs.rmSync(file, { force: true });
+      throw new Error(`SECURITY ERROR: smctl checksum mismatch.\nExpected: ${env.DC_SMCTL_SHA256}\nActual:   ${actual}`);
+    }
     console.log('smctl checksum verified.');
-  } else console.error('WARNING: smctl checksum unavailable; skipping verification.');
+  } else console.error('WARNING: use-binary-sha256-checksum is false; smctl checksum verification skipped.');
   fs.chmodSync(file, 0o755);
 }
 

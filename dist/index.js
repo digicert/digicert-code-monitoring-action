@@ -231,7 +231,7 @@ function createRelease() {
     if (externalId) args.push('--external-id', String(externalId));
     authorArgs(args, author);
   } else {
-    const sha = env.GITHUB_SHA || '';
+    const sha = env.DC_COMMIT_SHA || env.GITHUB_SHA || '';
     const runId = env.GITHUB_RUN_ID || '0';
     args.push('--release-type', 'BUILD_ONLY', '--tag', sha.slice(0, 8), '--release-url', `https://github.com/${env.GITHUB_REPOSITORY}/commit/${sha}`, '--external-id', runId, '--external-global-id', `${sha.slice(0, 27)}-${runId.slice(0, 8)}`);
     authorArgs(args, actorInfo());
@@ -286,10 +286,12 @@ function runGitleaks(env, work) {
   const report = child(env.GITHUB_WORKSPACE, env.DC_GITLEAKS_SARIF_OUTPUT);
   const scanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-scan-'));
   const archive = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dc-archive-')), 'source.tar');
+  // Remove any stale report so only this run's output is uploaded.
+  fs.rmSync(report, { force: true });
   try {
     runLogged('git', ['archive', '--output', archive, 'HEAD'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE, env: { ...env, GIT_LFS_SKIP_SMUDGE: '1' } });
     runLogged('tar', ['-xf', archive, '-C', scanDir], gitleaksLog);
-    runLogged('gitleaks', ['detect', '--source', scanDir, '--report-format', 'sarif', '--report-path', report, '--no-banner', '--redact', '--no-git'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE, ignoreFailure: true });
+    runLogged('gitleaks', ['detect', '--source', scanDir, '--report-format', 'sarif', '--report-path', report, '--exit-code', '0', '--no-banner', '--redact', '--no-git'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE });
     if (!fs.existsSync(report)) throw new Error('Gitleaks did not produce a SARIF report.');
     let findings = 0;
     try { findings = JSON.parse(fs.readFileSync(report, 'utf8')).runs[0].results.length; } catch { findings = 0; }
@@ -327,17 +329,19 @@ function resolveLanguages() {
   let languages = env.DC_INPUT_LANGUAGES || '';
   if (!languages) {
     const result = run('gh', ['api', `repos/${env.GITHUB_REPOSITORY}/languages`, '--jq', 'keys[]'], { allowFailure: true });
+    if (result.status !== 0) {
+      throw new Error(`Failed to detect repository languages via the GitHub API (exit ${result.status}):\n${(result.stderr || '').trim()}\nEnsure github-token can read this repository, or set the 'languages' input explicitly.`);
+    }
     const mapping = { 'C#': 'csharp', Go: 'go', Java: 'java', Kotlin: 'java', JavaScript: 'javascript', TypeScript: 'javascript', Python: 'python', Ruby: 'ruby', Swift: 'swift' };
     const mapped = [];
-    if (result.status === 0) {
-      for (const language of result.stdout.split('\n')) {
-        if (language === 'C' || language === 'C++') console.log(`Skipping ${language}: requires a manual build; not auto-scanned.`);
-        const codeql = Object.hasOwn(mapping, language) ? mapping[language] : '';
-        if (codeql && !mapped.includes(codeql)) mapped.push(codeql);
-      }
+    const detected = result.stdout.split('\n').filter(Boolean);
+    for (const language of detected) {
+      if (language === 'C' || language === 'C++') console.log(`Skipping ${language}: not auto-scanned (no traced build available).`);
+      const codeql = Object.hasOwn(mapping, language) ? mapping[language] : '';
+      if (codeql && !mapped.includes(codeql)) mapped.push(codeql);
     }
     languages = mapped.join(',');
-    if (!languages) console.error('No CodeQL-supported languages detected; leaving empty for CodeQL autodetection fallback.');
+    if (!languages) console.error(detected.length ? 'No CodeQL-supported languages detected; CodeQL analysis will be skipped.' : 'GitHub reported no languages for this repository; CodeQL analysis will be skipped.');
   } else console.log(`Using languages override: ${languages}`);
   const list = languages.split(',').filter(Boolean);
   const hasBuild = list.some((language) => ['go', 'swift'].includes(language));
@@ -482,6 +486,22 @@ function rejectControls(value, name) {
   if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`Invalid ${name}: contains control characters.`);
 }
 
+// These values reach download URLs, cache keys and tool-cache paths, so allow only a safe charset.
+function safeToken(value, pattern, message) {
+  rejectControls(value, 'input');
+  if (!pattern.test(value)) throw new Error(message);
+  return value;
+}
+
+function toolInputs(env) {
+  const useChecksum = xargs((env.RAW_USE_CHECKSUM || 'true').toLowerCase()) || 'true';
+  if (!['true', 'false'].includes(useChecksum)) throw new Error(`Invalid use-binary-sha256-checksum: '${useChecksum}' (use true|false).`);
+  const cacheVersion = safeToken(env.RAW_CACHE_VERSION || '0.0.0-0', /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'Invalid cache-version: use 1-64 characters from [A-Za-z0-9._-], starting with an alphanumeric.');
+  const gitleaksVersion = safeToken(env.RAW_GITLEAKS_VERSION || '8.18.4', /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/, 'Invalid gitleaks-version: use a plain X.Y.Z release version (e.g. 8.18.4).');
+  const codeqlTools = env.RAW_CODEQL_TOOLS_VERSION ? safeToken(env.RAW_CODEQL_TOOLS_VERSION, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'Invalid codeql-tools-version: use a version such as 2.17.6 (1-64 characters from [A-Za-z0-9._-]).') : '';
+  return { useChecksum, cacheVersion, gitleaksVersion, codeqlTools };
+}
+
 function artifactInputs(env) {
   const skipSbom = (env.RAW_SKIP_SBOM || 'false').trim().toLowerCase();
   const skipSarif = (env.RAW_SKIP_SARIF || 'false').trim().toLowerCase();
@@ -525,12 +545,17 @@ async function normalizeInputs() {
   rejectControls(cdn, 'digicert-cdn');
   if (!cdn.startsWith('https://')) throw new Error(`Invalid digicert-cdn: '${cdn}' must use HTTPS.`);
   cdn = cdn.replace(/\/$/, '');
+  const tools = toolInputs(env);
   const externalFiles = await downloadExternal(entries, env.RUNNER_TEMP);
 
   exportEnv('DC_INPUT_HOST', host);
   exportEnv('DC_INPUT_WITH_RELEASE', withRelease);
   exportEnv('DC_INPUT_SBOM_SPEC', spec);
   exportEnv('DC_INPUT_CDN', cdn);
+  exportEnv('DC_INPUT_USE_CHECKSUM', tools.useChecksum);
+  exportEnv('DC_INPUT_CACHE_VERSION', tools.cacheVersion);
+  exportEnv('DC_GITLEAKS_VERSION', tools.gitleaksVersion);
+  exportEnv('DC_CODEQL_TOOLS_VERSION', tools.codeqlTools);
   for (const [field] of fields) exportEnv(`DC_INPUT_${field}`, env[`RAW_${field}`] || '');
   exportEnv('DC_INPUT_LANGUAGES', languages);
   exportEnv('DC_SKIP_SBOM', skipSbom);
@@ -564,8 +589,6 @@ function resolveContext() {
     DC_CODEQL_SCAN_ZIP: 'codeql-scan.zip',
     DC_GITLEAKS_SCAN_ZIP: 'gitleaks-scan.zip',
     DC_SBOM_OUTPUT: 'sbom.cdx.json',
-    DC_GITLEAKS_VERSION: env.DC_GITLEAKS_VERSION_INPUT || '8.18.4',
-    DC_CODEQL_TOOLS_VERSION: env.DC_CODEQL_TOOLS_VERSION_INPUT || '',
   };
   for (const [name, value] of Object.entries(values)) exportEnv(name, value);
 }
@@ -583,7 +606,7 @@ const fs = __nccwpck_require__(24);
 const os = __nccwpck_require__(161);
 const path = __nccwpck_require__(760);
 const crypto = __nccwpck_require__(598);
-const { exportEnv, addPath, run, xargs } = __nccwpck_require__(128);
+const { exportEnv, addPath, run } = __nccwpck_require__(128);
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -605,23 +628,22 @@ function checksum(file) {
 async function cacheKeys() {
   const env = process.env;
   const cache = env.RUNNER_TOOL_CACHE || `${env.RUNNER_TEMP || '/tmp'}/tool-cache`;
-  const cacheVersion = env.DC_CACHE_VERSION || '0.0.0-0';
   let sha = '';
-  let version = `0.0.0-${cacheVersion}`;
-  if (xargs((env.DC_USE_CHECKSUM || 'true').toLowerCase()) === 'true') {
+  let version = `0.0.0-${env.DC_INPUT_CACHE_VERSION}`;
+  if (env.DC_INPUT_USE_CHECKSUM === 'true') {
+    // Fail closed: without a valid digest smctl must not be run.
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-sha-'));
     try {
       const file = path.join(temp, 'smctl.sha256');
-      await fetch(`${env.DC_INPUT_CDN}/smctl.sha256`, file, 60);
-      const candidate = (fs.readFileSync(file, 'utf8').trim().split(/\s+/)[0] || '').toLowerCase();
-      if (/^[a-f0-9]{64}$/.test(candidate)) {
-        sha = candidate;
-        version = `0.0.0-${sha}`;
-      } else {
-        console.error('Unexpected smctl.sha256 content; falling back to cache-version.');
+      try { await fetch(`${env.DC_INPUT_CDN}/smctl.sha256`, file, 60); } catch {
+        throw new Error(`SECURITY ERROR: could not fetch ${env.DC_INPUT_CDN}/smctl.sha256; refusing to run unverified smctl.\nSet use-binary-sha256-checksum: false only if you accept that risk.`);
       }
-    } catch (error) {
-      console.error(`Could not fetch smctl.sha256; falling back to cache-version. ${error.message}`);
+      const candidate = (fs.readFileSync(file, 'utf8').trim().split(/\s+/)[0] || '').toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(candidate)) {
+        throw new Error('SECURITY ERROR: unexpected smctl.sha256 content; refusing to run unverified smctl.\nSet use-binary-sha256-checksum: false only if you accept that risk.');
+      }
+      sha = candidate;
+      version = `0.0.0-${sha}`;
     } finally {
       fs.rmSync(temp, { recursive: true, force: true });
     }
@@ -632,7 +654,7 @@ async function cacheKeys() {
     DC_SMCTL_TOOL_CACHE_ROOT: `${cache}/smctl`,
     DC_GITLEAKS_TOOL_CACHE_ROOT: `${cache}/gitleaks`,
     DC_SMCTL_SHA256: sha,
-    SMCTL_CACHE_KEY: `smctl-${cacheVersion}-linux-x64`,
+    SMCTL_CACHE_KEY: `smctl-${version}-linux-x64`,
     GITLEAKS_CACHE_KEY: `gitleaks-${env.DC_GITLEAKS_VERSION}-linux-x64`,
   };
   for (const [name, value] of Object.entries(values)) exportEnv(name, value);
@@ -645,15 +667,24 @@ function executable(file) {
 async function downloadSmctl() {
   const env = process.env;
   const file = path.join(env.DC_SMCTL_BIN_DIR, 'smctl');
-  if (executable(file)) return console.log(`smctl found in tool cache @ ${env.DC_SMCTL_BIN_DIR}`);
+  // In checksum mode a cached binary is re-hashed so a corrupted or poisoned entry is never executed.
+  if (executable(file)) {
+    if (!env.DC_SMCTL_SHA256) return console.log(`smctl found in tool cache @ ${env.DC_SMCTL_BIN_DIR} (checksum verification disabled)`);
+    if (checksum(file) === env.DC_SMCTL_SHA256) return console.log(`smctl found in tool cache @ ${env.DC_SMCTL_BIN_DIR}; checksum verified.`);
+    console.error('WARNING: cached smctl does not match the expected checksum; discarding and redownloading.');
+    fs.rmSync(file, { force: true });
+  }
   fs.mkdirSync(env.DC_SMCTL_BIN_DIR, { recursive: true });
   console.log(`Downloading smctl from ${env.DC_INPUT_CDN}/smctl`);
   await fetch(`${env.DC_INPUT_CDN}/smctl`, file, 120);
   if (env.DC_SMCTL_SHA256) {
     const actual = checksum(file);
-    if (actual !== env.DC_SMCTL_SHA256) throw new Error(`SECURITY ERROR: smctl checksum mismatch.\nExpected: ${env.DC_SMCTL_SHA256}\nActual:   ${actual}`);
+    if (actual !== env.DC_SMCTL_SHA256) {
+      fs.rmSync(file, { force: true });
+      throw new Error(`SECURITY ERROR: smctl checksum mismatch.\nExpected: ${env.DC_SMCTL_SHA256}\nActual:   ${actual}`);
+    }
     console.log('smctl checksum verified.');
-  } else console.error('WARNING: smctl checksum unavailable; skipping verification.');
+  } else console.error('WARNING: use-binary-sha256-checksum is false; smctl checksum verification skipped.');
   fs.chmodSync(file, 0o755);
 }
 

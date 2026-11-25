@@ -15,20 +15,20 @@ inputs:
     required: true
 
   name:
-    description: "Scan/release name used to create the external release. Required when with-release is true."
+    description: "Scan/release name used to create the external release. Optional: when omitted it resolves to the repository name if with-release is true, otherwise to '<workflow>-<event>'."
     required: false
 
   with-release:
-    description: "When true, require name and tag and build the release name as '<name>-<tag>'; creates a RELEASED external release."
+    description: "When true, create a RELEASED external release named '<name>-<tag>' (name and tag are auto-resolved when omitted; see name and tag)."
     required: false
     default: "false"
 
   tag:
-    description: "Release tag used only when with-release is true (required when with-release is true)."
+    description: "Release tag used only when with-release is true. When omitted and the workflow was triggered by a tag push (refs/tags/<tag>), the tag is resolved from the ref; otherwise it is required when with-release is true."
     required: false
 
   dc-release-id:
-    description: "Optional pre-existing DCOne release ID. When provided, the action verifies it and reuses it instead of creating a new release."
+    description: "Optional pre-existing DCOne release ID. When provided, the action reuses it as-is for all uploads and skips release creation; it is NOT verified, so the caller must ensure it is valid."
     required: false
     default: ""
 
@@ -108,17 +108,17 @@ inputs:
     default: "true"
 
   use-binary-sha256-checksum:
-    description: "Key the smctl cache on the CDN smctl.sha256 so a new smctl build auto-invalidates the cache."
+    description: "Verify smctl (downloaded and cached) against the CDN smctl.sha256 and key the smctl cache on it, so a new smctl build auto-invalidates the cache. Fails the action if the checksum cannot be fetched or does not match; set to false only to explicitly accept unverified downloads."
     required: false
     default: "true"
 
   cache-version:
-    description: "Manual cache-busting key used for smctl when use-binary-sha256-checksum is false."
+    description: "Manual cache-busting key used for smctl when use-binary-sha256-checksum is false. Allowed characters: [A-Za-z0-9._-]."
     required: false
     default: "0.0.0-0"
 
   gitleaks-version:
-    description: "Gitleaks release version to download. Defaults to the action's pinned version; bump this to upgrade without waiting for an action release."
+    description: "Gitleaks release version (X.Y.Z) to download. Defaults to the action's pinned version; bump this to upgrade without waiting for an action release."
     required: false
     default: "8.18.4"
 
@@ -162,6 +162,10 @@ runs:
         RAW_SKIP_SBOM: ${{ inputs.skip-sbom }}
         RAW_SKIP_SARIF: ${{ inputs.skip-sarif }}
         RAW_EXTERNAL_PATHS: ${{ inputs.external-paths }}
+        RAW_USE_CHECKSUM: ${{ inputs.use-binary-sha256-checksum }}
+        RAW_CACHE_VERSION: ${{ inputs.cache-version }}
+        RAW_GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+        RAW_CODEQL_TOOLS_VERSION: ${{ inputs.codeql-tools-version }}
       run: node "$ACTION_DIR/dist/index.js" normalize-inputs
     # 3 -----------------------------------------------------------------------
     - name: Export smctl auth
@@ -183,8 +187,6 @@ runs:
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-        DC_GITLEAKS_VERSION_INPUT: ${{ inputs.gitleaks-version }}
-        DC_CODEQL_TOOLS_VERSION_INPUT: ${{ inputs.codeql-tools-version }}
         DC_INPUT_COMMIT_SHA: ${{ inputs.commit-sha }}
         DC_INPUT_BRANCH: ${{ inputs.branch }}
       run: node "$ACTION_DIR/dist/index.js" resolve-context
@@ -194,8 +196,6 @@ runs:
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-        DC_USE_CHECKSUM: ${{ inputs.use-binary-sha256-checksum }}
-        DC_CACHE_VERSION: ${{ inputs.cache-version }}
       run: node "$ACTION_DIR/dist/index.js" cache-keys
     - name: Restore smctl from cache
       id: smctl_cache

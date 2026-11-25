@@ -52,6 +52,37 @@ test('validates external artifact inputs and skip precedence', () => {
   assert.equal(execute('normalize-inputs', { ...base, RAW_EXTERNAL_PATHS: 'bad entry' }).status, 1);
 });
 
+test('validates and exports tool inputs used in URLs, cache keys and paths', () => {
+  const base = { RAW_HOST: 'https://example.com', RAW_CDN: 'https://cdn.example', RAW_API_KEY: 'secret' };
+  const defaults = execute('normalize-inputs', base);
+  assert.equal(defaults.status, 0, defaults.stderr);
+  assert.match(defaults.output, /DC_INPUT_USE_CHECKSUM<<[^\n]+\ntrue\n/);
+  assert.match(defaults.output, /DC_INPUT_CACHE_VERSION<<[^\n]+\n0\.0\.0-0\n/);
+  assert.match(defaults.output, /DC_GITLEAKS_VERSION<<[^\n]+\n8\.18\.4\n/);
+  assert.match(defaults.output, /DC_CODEQL_TOOLS_VERSION<<[^\n]+\n\n/);
+  const custom = execute('normalize-inputs', { ...base, RAW_USE_CHECKSUM: 'FALSE', RAW_CACHE_VERSION: 'v2.1_a', RAW_GITLEAKS_VERSION: '8.19.0', RAW_CODEQL_TOOLS_VERSION: '2.17.6' });
+  assert.equal(custom.status, 0, custom.stderr);
+  assert.match(custom.output, /DC_INPUT_USE_CHECKSUM<<[^\n]+\nfalse\n/);
+  assert.match(custom.output, /DC_GITLEAKS_VERSION<<[^\n]+\n8\.19\.0\n/);
+  assert.match(custom.output, /DC_CODEQL_TOOLS_VERSION<<[^\n]+\n2\.17\.6\n/);
+  for (const override of [
+    { RAW_USE_CHECKSUM: 'maybe' },
+    { RAW_CACHE_VERSION: '../escape' },
+    { RAW_CACHE_VERSION: '-leading' },
+    { RAW_CACHE_VERSION: 'a'.repeat(65) },
+    { RAW_CACHE_VERSION: 'ok\nINJECTED=1' },
+    { RAW_GITLEAKS_VERSION: '8.18' },
+    { RAW_GITLEAKS_VERSION: '8.18.4/../../x' },
+    { RAW_GITLEAKS_VERSION: '8.18.4\nINJECTED=1' },
+    { RAW_CODEQL_TOOLS_VERSION: 'bad version' },
+    { RAW_CODEQL_TOOLS_VERSION: '2.17.6\nINJECTED=1' },
+  ]) {
+    const result = execute('normalize-inputs', { ...base, ...override });
+    assert.equal(result.status, 1, JSON.stringify(override));
+    assert.equal(result.output, '', JSON.stringify(override));
+  }
+});
+
 test('computes run flags from skip settings', () => {
   const base = { RAW_HOST: 'https://example.com', RAW_CDN: 'https://cdn.example', RAW_API_KEY: 'secret' };
   const flags = (output) => Object.fromEntries(['CODEQL', 'GITLEAKS', 'SBOM'].map((name) => [name, new RegExp(`DC_RUN_${name}<<[^\\n]+\\n(\\w+)\\n`).exec(output)[1]]));

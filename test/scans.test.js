@@ -89,6 +89,54 @@ test('runs Gitleaks when only CodeQL is supplied externally', () => {
   } finally { data.cleanup(); }
 });
 
+test('runs Gitleaks with exit-code 0, removes a stale report, and fails on a real scanner error', () => {
+  const data = fixture();
+  try {
+    initializeGit(data.workspace);
+    const stale = path.join(data.workspace, 'gitleaks.sarif');
+    fs.writeFileSync(stale, 'stale report');
+    const ok = data.execute('start-scans', { DC_RUN_SBOM: 'false' });
+    assert.equal(ok.status, 0, ok.stderr);
+    const args = ok.calls.find((call) => call[0] === 'gitleaks');
+    assert.equal(args[args.indexOf('--exit-code') + 1], '0');
+    assert.notEqual(fs.readFileSync(stale, 'utf8'), 'stale report');
+    const bin = path.join(data.root, 'bin', 'gitleaks');
+    fs.writeFileSync(bin, `#!${process.execPath}\nprocess.exit(2);\n`, { mode: 0o755 });
+    fs.rmSync(stale);
+    const failed = data.execute('start-scans', { DC_RUN_SBOM: 'false' });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /gitleaks failed \(exit 2\)/);
+    assert.equal(fs.existsSync(stale), false);
+  } finally { data.cleanup(); }
+});
+
+test('fails when repository languages cannot be detected and explains how to proceed', () => {
+  const data = fixture();
+  try {
+    fs.writeFileSync(path.join(data.root, 'bin', 'gh'), `#!${process.execPath}\nconsole.error('HTTP 403: forbidden');\nprocess.exit(1);\n`, { mode: 0o755 });
+    const result = data.execute('resolve-languages');
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Failed to detect repository languages/);
+    assert.match(result.stderr, /HTTP 403/);
+    assert.match(result.stderr, /set the 'languages' input explicitly/);
+    assert.equal(result.exported, '');
+    const explicit = data.execute('resolve-languages', { DC_INPUT_LANGUAGES: 'java' });
+    assert.equal(explicit.status, 0, explicit.stderr);
+  } finally { data.cleanup(); }
+});
+
+test('says CodeQL will be skipped when no supported language is detected', () => {
+  for (const languages of ['', 'Shell\nMakefile']) {
+    const data = fixture();
+    try {
+      const result = data.execute('resolve-languages', { LANGUAGES: languages });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stderr, /CodeQL analysis will be skipped/);
+      assert.match(result.exported, /DC_LANGUAGES<<[^\n]+\n\n/);
+    } finally { data.cleanup(); }
+  }
+});
+
 test('times out when scan markers are missing', () => {
   const data = fixture();
   try {

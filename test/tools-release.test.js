@@ -31,10 +31,10 @@ function fixture() {
 test('computes cache paths when checksum is disabled', () => {
   const data = fixture();
   try {
-    const result = data.execute('cache-keys', { RUNNER_TOOL_CACHE: '/tool-cache', DC_USE_CHECKSUM: 'false', DC_CACHE_VERSION: '4', DC_GITLEAKS_VERSION: '8.18.4' });
+    const result = data.execute('cache-keys', { RUNNER_TOOL_CACHE: '/tool-cache', DC_INPUT_USE_CHECKSUM: 'false', DC_INPUT_CACHE_VERSION: '4', DC_GITLEAKS_VERSION: '8.18.4' });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.exported, /DC_SMCTL_BIN_DIR<<[^\n]+\n\/tool-cache\/smctl\/0.0.0-4\/x64\n/);
-    assert.match(result.exported, /SMCTL_CACHE_KEY<<[^\n]+\nsmctl-4-linux-x64\n/);
+    assert.match(result.exported, /SMCTL_CACHE_KEY<<[^\n]+\nsmctl-0.0.0-4-linux-x64\n/);
   } finally { data.cleanup(); }
 });
 
@@ -47,7 +47,7 @@ test('verifies smctl checksum and rejects a mismatch', () => {
     const result = data.execute('download-smctl', { DC_SMCTL_BIN_DIR: bin, DC_INPUT_CDN: 'https://cdn.example', DC_SMCTL_SHA256: '0'.repeat(64), DOWNLOAD_SOURCE: source });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /checksum mismatch/);
-    assert.equal(fs.statSync(path.join(bin, 'smctl')).mode & 0o111, 0);
+    assert.equal(fs.existsSync(path.join(bin, 'smctl')), false);
   } finally { data.cleanup(); }
 });
 
@@ -71,9 +71,46 @@ test('includes the fetched checksum in the inner cache directory', () => {
     const source = path.join(data.directory, 'checksum');
     const digest = 'a'.repeat(64);
     fs.writeFileSync(source, `${digest}  smctl\n`);
-    const result = data.execute('cache-keys', { RUNNER_TOOL_CACHE: '/tool-cache', DC_INPUT_CDN: 'https://cdn.example', DC_USE_CHECKSUM: 'true', DC_GITLEAKS_VERSION: '8.18.4', DOWNLOAD_SOURCE: source });
+    const result = data.execute('cache-keys', { RUNNER_TOOL_CACHE: '/tool-cache', DC_INPUT_CDN: 'https://cdn.example', DC_INPUT_USE_CHECKSUM: 'true', DC_INPUT_CACHE_VERSION: '0.0.0-0', DC_GITLEAKS_VERSION: '8.18.4', DOWNLOAD_SOURCE: source });
     assert.equal(result.status, 0, result.stderr);
     assert.ok(result.exported.includes(`/tool-cache/smctl/0.0.0-${digest}/x64`));
+    assert.match(result.exported, new RegExp(`SMCTL_CACHE_KEY<<[^\\n]+\\nsmctl-0.0.0-${digest}-linux-x64\\n`));
+  } finally { data.cleanup(); }
+});
+
+test('fails closed when the CDN checksum is missing or malformed', () => {
+  const data = fixture();
+  try {
+    const malformed = path.join(data.directory, 'checksum');
+    fs.writeFileSync(malformed, 'not-a-digest\n');
+    const base = { RUNNER_TOOL_CACHE: '/tool-cache', DC_INPUT_CDN: 'https://cdn.example', DC_INPUT_USE_CHECKSUM: 'true', DC_INPUT_CACHE_VERSION: '0.0.0-0', DC_GITLEAKS_VERSION: '8.18.4' };
+    const invalid = data.execute('cache-keys', { ...base, DOWNLOAD_SOURCE: malformed });
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /unexpected smctl.sha256 content; refusing to run unverified smctl/);
+    assert.equal(invalid.exported, '');
+    const missing = data.execute('cache-keys', { ...base, DOWNLOAD_SOURCE: path.join(data.directory, 'does-not-exist') });
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /could not fetch .*smctl.sha256; refusing to run unverified smctl/);
+    assert.equal(missing.exported, '');
+  } finally { data.cleanup(); }
+});
+
+test('re-hashes a cached smctl and discards a mismatching one', () => {
+  const data = fixture();
+  try {
+    const source = path.join(data.directory, 'binary');
+    fs.writeFileSync(source, 'fresh binary');
+    const digest = crypto.createHash('sha256').update('fresh binary').digest('hex');
+    const bin = path.join(data.directory, 'smctl-bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'smctl'), 'poisoned', { mode: 0o755 });
+    const result = data.execute('download-smctl', { DC_SMCTL_BIN_DIR: bin, DC_INPUT_CDN: 'https://cdn.example', DC_SMCTL_SHA256: digest, DOWNLOAD_SOURCE: source });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /does not match the expected checksum/);
+    assert.equal(fs.readFileSync(path.join(bin, 'smctl'), 'utf8'), 'fresh binary');
+    const cached = data.execute('download-smctl', { DC_SMCTL_BIN_DIR: bin, DC_SMCTL_SHA256: digest });
+    assert.equal(cached.status, 0, cached.stderr);
+    assert.match(cached.stdout, /checksum verified/);
   } finally { data.cleanup(); }
 });
 
@@ -131,16 +168,22 @@ test('reuses release ID without calling external commands', () => {
   } finally { data.cleanup(); }
 });
 
-test('build release uses override for smctl and triggering SHA for metadata', () => {
+test('build release uses the commit override for metadata and the triggering SHA otherwise', () => {
   const data = fixture();
   try {
-    const result = data.execute('create-release', { DC_INPUT_WITH_RELEASE: 'false', DC_INPUT_NAME: '', DC_COMMIT_SHA: 'override', DC_REF_NAME: 'main', GITHUB_SHA: '1234567890', GITHUB_REPOSITORY: 'owner/repo', GITHUB_ACTOR: 'actor', GITHUB_RUN_ID: '456', GH_RESPONSE: '{"id":9,"node_id":"author-node"}' });
+    const base = { DC_INPUT_WITH_RELEASE: 'false', DC_INPUT_NAME: '', DC_REF_NAME: 'main', GITHUB_SHA: '1234567890', GITHUB_REPOSITORY: 'owner/repo', GITHUB_ACTOR: 'actor', GITHUB_RUN_ID: '456', GH_RESPONSE: '{"id":9,"node_id":"author-node"}' };
+    const result = data.execute('create-release', { ...base, DC_COMMIT_SHA: 'abcdef0123456789' });
     assert.equal(result.status, 0, result.stderr);
     const args = result.calls.find((call) => call[0] === 'smctl');
-    assert.equal(args[args.indexOf('--commit-sha') + 1], 'override');
-    assert.equal(args[args.indexOf('--tag') + 1], '12345678');
+    assert.equal(args[args.indexOf('--commit-sha') + 1], 'abcdef0123456789');
+    assert.equal(args[args.indexOf('--tag') + 1], 'abcdef01');
+    assert.equal(args[args.indexOf('--release-url') + 1], 'https://github.com/owner/repo/commit/abcdef0123456789');
+    assert.equal(args[args.indexOf('--external-global-id') + 1], 'abcdef0123456789-456');
     assert.equal(args[args.indexOf('--author-external-id') + 1], '9');
     assert.match(result.exported, /DC_RELEASE_ID<<[^\n]+\nrel-123\n/);
+    const fallback = data.execute('create-release', { ...base, DC_COMMIT_SHA: '' });
+    const fallbackArgs = fallback.calls.filter((call) => call[0] === 'smctl').at(-1);
+    assert.equal(fallbackArgs[fallbackArgs.indexOf('--tag') + 1], '12345678');
   } finally { data.cleanup(); }
 });
 

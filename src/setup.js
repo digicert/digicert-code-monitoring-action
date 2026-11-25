@@ -7,6 +7,22 @@ function rejectControls(value, name) {
   if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`Invalid ${name}: contains control characters.`);
 }
 
+// These values reach download URLs, cache keys and tool-cache paths, so allow only a safe charset.
+function safeToken(value, pattern, message) {
+  rejectControls(value, 'input');
+  if (!pattern.test(value)) throw new Error(message);
+  return value;
+}
+
+function toolInputs(env) {
+  const useChecksum = xargs((env.RAW_USE_CHECKSUM || 'true').toLowerCase()) || 'true';
+  if (!['true', 'false'].includes(useChecksum)) throw new Error(`Invalid use-binary-sha256-checksum: '${useChecksum}' (use true|false).`);
+  const cacheVersion = safeToken(env.RAW_CACHE_VERSION || '0.0.0-0', /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'Invalid cache-version: use 1-64 characters from [A-Za-z0-9._-], starting with an alphanumeric.');
+  const gitleaksVersion = safeToken(env.RAW_GITLEAKS_VERSION || '8.18.4', /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/, 'Invalid gitleaks-version: use a plain X.Y.Z release version (e.g. 8.18.4).');
+  const codeqlTools = env.RAW_CODEQL_TOOLS_VERSION ? safeToken(env.RAW_CODEQL_TOOLS_VERSION, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'Invalid codeql-tools-version: use a version such as 2.17.6 (1-64 characters from [A-Za-z0-9._-]).') : '';
+  return { useChecksum, cacheVersion, gitleaksVersion, codeqlTools };
+}
+
 function artifactInputs(env) {
   const skipSbom = (env.RAW_SKIP_SBOM || 'false').trim().toLowerCase();
   const skipSarif = (env.RAW_SKIP_SARIF || 'false').trim().toLowerCase();
@@ -50,12 +66,17 @@ async function normalizeInputs() {
   rejectControls(cdn, 'digicert-cdn');
   if (!cdn.startsWith('https://')) throw new Error(`Invalid digicert-cdn: '${cdn}' must use HTTPS.`);
   cdn = cdn.replace(/\/$/, '');
+  const tools = toolInputs(env);
   const externalFiles = await downloadExternal(entries, env.RUNNER_TEMP);
 
   exportEnv('DC_INPUT_HOST', host);
   exportEnv('DC_INPUT_WITH_RELEASE', withRelease);
   exportEnv('DC_INPUT_SBOM_SPEC', spec);
   exportEnv('DC_INPUT_CDN', cdn);
+  exportEnv('DC_INPUT_USE_CHECKSUM', tools.useChecksum);
+  exportEnv('DC_INPUT_CACHE_VERSION', tools.cacheVersion);
+  exportEnv('DC_GITLEAKS_VERSION', tools.gitleaksVersion);
+  exportEnv('DC_CODEQL_TOOLS_VERSION', tools.codeqlTools);
   for (const [field] of fields) exportEnv(`DC_INPUT_${field}`, env[`RAW_${field}`] || '');
   exportEnv('DC_INPUT_LANGUAGES', languages);
   exportEnv('DC_SKIP_SBOM', skipSbom);
@@ -89,8 +110,6 @@ function resolveContext() {
     DC_CODEQL_SCAN_ZIP: 'codeql-scan.zip',
     DC_GITLEAKS_SCAN_ZIP: 'gitleaks-scan.zip',
     DC_SBOM_OUTPUT: 'sbom.cdx.json',
-    DC_GITLEAKS_VERSION: env.DC_GITLEAKS_VERSION_INPUT || '8.18.4',
-    DC_CODEQL_TOOLS_VERSION: env.DC_CODEQL_TOOLS_VERSION_INPUT || '',
   };
   for (const [name, value] of Object.entries(values)) exportEnv(name, value);
 }

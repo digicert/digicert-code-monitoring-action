@@ -30,10 +30,12 @@ function runGitleaks(env, work) {
   const report = child(env.GITHUB_WORKSPACE, env.DC_GITLEAKS_SARIF_OUTPUT);
   const scanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-scan-'));
   const archive = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dc-archive-')), 'source.tar');
+  // Remove any stale report so only this run's output is uploaded.
+  fs.rmSync(report, { force: true });
   try {
     runLogged('git', ['archive', '--output', archive, 'HEAD'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE, env: { ...env, GIT_LFS_SKIP_SMUDGE: '1' } });
     runLogged('tar', ['-xf', archive, '-C', scanDir], gitleaksLog);
-    runLogged('gitleaks', ['detect', '--source', scanDir, '--report-format', 'sarif', '--report-path', report, '--no-banner', '--redact', '--no-git'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE, ignoreFailure: true });
+    runLogged('gitleaks', ['detect', '--source', scanDir, '--report-format', 'sarif', '--report-path', report, '--exit-code', '0', '--no-banner', '--redact', '--no-git'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE });
     if (!fs.existsSync(report)) throw new Error('Gitleaks did not produce a SARIF report.');
     let findings = 0;
     try { findings = JSON.parse(fs.readFileSync(report, 'utf8')).runs[0].results.length; } catch { findings = 0; }
@@ -71,17 +73,19 @@ function resolveLanguages() {
   let languages = env.DC_INPUT_LANGUAGES || '';
   if (!languages) {
     const result = run('gh', ['api', `repos/${env.GITHUB_REPOSITORY}/languages`, '--jq', 'keys[]'], { allowFailure: true });
+    if (result.status !== 0) {
+      throw new Error(`Failed to detect repository languages via the GitHub API (exit ${result.status}):\n${(result.stderr || '').trim()}\nEnsure github-token can read this repository, or set the 'languages' input explicitly.`);
+    }
     const mapping = { 'C#': 'csharp', Go: 'go', Java: 'java', Kotlin: 'java', JavaScript: 'javascript', TypeScript: 'javascript', Python: 'python', Ruby: 'ruby', Swift: 'swift' };
     const mapped = [];
-    if (result.status === 0) {
-      for (const language of result.stdout.split('\n')) {
-        if (language === 'C' || language === 'C++') console.log(`Skipping ${language}: requires a manual build; not auto-scanned.`);
-        const codeql = Object.hasOwn(mapping, language) ? mapping[language] : '';
-        if (codeql && !mapped.includes(codeql)) mapped.push(codeql);
-      }
+    const detected = result.stdout.split('\n').filter(Boolean);
+    for (const language of detected) {
+      if (language === 'C' || language === 'C++') console.log(`Skipping ${language}: not auto-scanned (no traced build available).`);
+      const codeql = Object.hasOwn(mapping, language) ? mapping[language] : '';
+      if (codeql && !mapped.includes(codeql)) mapped.push(codeql);
     }
     languages = mapped.join(',');
-    if (!languages) console.error('No CodeQL-supported languages detected; leaving empty for CodeQL autodetection fallback.');
+    if (!languages) console.error(detected.length ? 'No CodeQL-supported languages detected; CodeQL analysis will be skipped.' : 'GitHub reported no languages for this repository; CodeQL analysis will be skipped.');
   } else console.log(`Using languages override: ${languages}`);
   const list = languages.split(',').filter(Boolean);
   const hasBuild = list.some((language) => ['go', 'swift'].includes(language));

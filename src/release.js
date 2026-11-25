@@ -61,7 +61,7 @@ function createRelease() {
     if (externalId) args.push('--external-id', String(externalId));
     authorArgs(args, author);
   } else {
-    const sha = env.GITHUB_SHA || '';
+    const sha = env.DC_COMMIT_SHA || env.GITHUB_SHA || '';
     const runId = env.GITHUB_RUN_ID || '0';
     args.push('--release-type', 'BUILD_ONLY', '--tag', sha.slice(0, 8), '--release-url', `https://github.com/${env.GITHUB_REPOSITORY}/commit/${sha}`, '--external-id', runId, '--external-global-id', `${sha.slice(0, 27)}-${runId.slice(0, 8)}`);
     authorArgs(args, actorInfo());
