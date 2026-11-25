@@ -15,6 +15,10 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
@@ -22,14 +26,37 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - run: npm ci
 
       - run: npm test
 
-      # Fails when dist/index.js does not match a fresh build of src/.
-      - run: npm run check-build
+      # The bundle is built with Node 24; only that job compares it with the committed one.
+      - if: matrix.node == 24
+        run: npm run check-build
 
       - run: npm run test:dist
+
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          persist-credentials: false
+
+      # Real run of the fallback: Node 18 on PATH must trigger the pinned private Node.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 18
+
+      - name: Install fallback Node.js and run the bundle with it
+        run: |
+          export GITHUB_ENV="$RUNNER_TEMP/github_env"
+          : > "$GITHUB_ENV"
+          bash scripts/ensure-node.sh
+          DC_NODE="$(sed -n 's/^DC_NODE=//p' "$GITHUB_ENV")"
+          test -x "$DC_NODE"
+          "$DC_NODE" --version | grep -q '^v24\.'
+          GITHUB_EVENT_NAME=pull_request_target "$DC_NODE" dist/index.js guard-trigger && exit 1 || true

@@ -18,7 +18,7 @@ function fixture() {
   fs.mkdirSync(bin);
   fs.writeFileSync(envFile, '');
   for (const command of ['gh', 'gitleaks', 'smctl']) {
-    const script = `#!${process.execPath}\nconst fs = require('node:fs');\nconst args = process.argv.slice(2);\nfs.appendFileSync(process.env.CALL_LOG, JSON.stringify([${JSON.stringify(command)}, ...args]) + '\\n');\nif (${JSON.stringify(command)} === 'gh') console.log(process.env.LANGUAGES || '');\nif (${JSON.stringify(command)} === 'gitleaks' && process.env.LARGE_SCAN_LOG) process.stdout.write('x'.repeat(2 * 1024 * 1024));\nif (${JSON.stringify(command)} === 'gitleaks') fs.writeFileSync(args[args.indexOf('--report-path') + 1], JSON.stringify({runs:[{results:[]}]}));\nif (${JSON.stringify(command)} === 'smctl' && args[1] === 'generate') fs.writeFileSync(args[args.indexOf('--output') + 1], '{}');\nif (${JSON.stringify(command)} === 'smctl' && args[1] === 'upload' && args.includes('CODEQL') && process.env.FAIL_CODEQL) process.exit(1);\n`;
+    const script = `#!${process.execPath}\nconst fs = require('node:fs');\nconst args = process.argv.slice(2);\nfs.appendFileSync(process.env.CALL_LOG, JSON.stringify([${JSON.stringify(command)}, ...args]) + '\\n');\nif (${JSON.stringify(command)} === 'gh') console.log(process.env.LANGUAGES || '');\nif (${JSON.stringify(command)} === 'gitleaks' && process.env.LARGE_SCAN_LOG) process.stdout.write('x'.repeat(2 * 1024 * 1024));\nif (${JSON.stringify(command)} === 'gitleaks') fs.writeFileSync(args[args.indexOf('--report-path') + 1], JSON.stringify({runs:[{results:[]}]}));\nif (${JSON.stringify(command)} === 'smctl' && args[1] === 'generate' && process.env.SLEEP_GENERATE) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.SLEEP_GENERATE) * 1000);\nif (${JSON.stringify(command)} === 'smctl' && args[1] === 'generate' && process.env.FAIL_GENERATE) { fs.writeFileSync(args[args.indexOf('--output') + 1], 'partial'); process.exit(1); }\nif (${JSON.stringify(command)} === 'smctl' && args[1] === 'generate') fs.writeFileSync(args[args.indexOf('--output') + 1], '{}');\nif (${JSON.stringify(command)} === 'smctl' && args[1] === 'upload' && args.includes('CODEQL') && process.env.FAIL_CODEQL) process.exit(1);\n`;
     fs.writeFileSync(path.join(bin, command), script, { mode: 0o755 });
   }
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, GITHUB_ENV: envFile, CALL_LOG: log, GITHUB_WORKSPACE: workspace, RUNNER_TEMP: root, DC_INPUT_SBOM_SPEC: '1.6', DC_GITLEAKS_SARIF_OUTPUT: 'gitleaks.sarif', DC_CODEQL_SCAN_ZIP: 'codeql.zip', DC_GITLEAKS_SCAN_ZIP: 'gitleaks.zip', DC_SBOM_OUTPUT: 'sbom.json', DC_SARIF_OUTPUT: path.join(workspace, 'codeql.sarif'), DC_RELEASE_ID: 'release-id', DC_REF_NAME: 'main', DC_COMMIT_SHA: 'commit', GITHUB_REPOSITORY: 'owner/repo', DC_RUN_CODEQL: 'true', DC_RUN_GITLEAKS: 'true', DC_RUN_SBOM: 'true' };
@@ -53,7 +53,7 @@ test('maps detected languages and selects the requested mode for mixed repositor
   } finally { data.cleanup(); }
 });
 
-test('creates scan artifacts sequentially and waits for exit markers', () => {
+test('creates scan artifacts sequentially and verifies the exit markers', () => {
   const data = fixture();
   try {
     initializeGit(data.workspace);
@@ -63,8 +63,8 @@ test('creates scan artifacts sequentially and waits for exit markers', () => {
     assert.ok(fs.existsSync(path.join(data.workspace, 'gitleaks.sarif')));
     assert.ok(fs.existsSync(path.join(data.workspace, 'sbom.json')));
     assert.ok(fs.statSync(path.join(data.root, 'dc-bg-jobs', 'gitleaks.log')).size > 2 * 1024 * 1024);
-    const wait = data.execute('wait-scans', { DC_BG_WORK_DIR: path.join(data.root, 'dc-bg-jobs') });
-    assert.equal(wait.status, 0, wait.stderr);
+    const verified = data.execute('verify-scans', { DC_BG_WORK_DIR: path.join(data.root, 'dc-bg-jobs') });
+    assert.equal(verified.status, 0, verified.stderr);
   } finally { data.cleanup(); }
 });
 
@@ -75,7 +75,7 @@ test('runs Gitleaks while SBOM is skipped', () => {
     const result = data.execute('start-scans', { DC_SKIP_SBOM: 'true', DC_RUN_SBOM: 'false' });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.calls.map((call) => call[0]), ['gitleaks']);
-    assert.equal(data.execute('wait-scans', { DC_RUN_SBOM: 'false', DC_BG_WORK_DIR: path.join(data.root, 'dc-bg-jobs'), DC_SCAN_TIMEOUT: '0' }).status, 0);
+    assert.equal(data.execute('verify-scans', { DC_RUN_SBOM: 'false', DC_BG_WORK_DIR: path.join(data.root, 'dc-bg-jobs') }).status, 0);
   } finally { data.cleanup(); }
 });
 
@@ -137,12 +137,79 @@ test('says CodeQL will be skipped when no supported language is detected', () =>
   }
 });
 
-test('times out when scan markers are missing', () => {
+test('stops a scan that exceeds scan-timeout and removes its partial output', () => {
   const data = fixture();
   try {
-    const result = data.execute('wait-scans', { DC_BG_WORK_DIR: data.root, DC_SCAN_TIMEOUT: '0' });
+    const started = Date.now();
+    const result = data.execute('start-scans', { DC_RUN_GITLEAKS: 'false', DC_INPUT_SCAN_TIMEOUT: '1', SLEEP_GENERATE: '20' });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /Timeout/);
+    assert.match(result.stderr, /smctl did not finish within the scan-timeout of 1s/);
+    assert.ok(Date.now() - started < 15000, 'the scan was killed, not waited for');
+    assert.equal(fs.existsSync(path.join(data.workspace, 'sbom.json')), false);
+    assert.equal(fs.existsSync(path.join(data.root, 'dc-bg-jobs', 'sbom.exit')), false);
+  } finally { data.cleanup(); }
+});
+
+test('removes a stale SBOM before generating and never uploads it after a failed generation', () => {
+  const data = fixture();
+  try {
+    const sbom = path.join(data.workspace, 'sbom.json');
+    fs.writeFileSync(sbom, 'committed or stale SBOM');
+    const failed = data.execute('start-scans', { DC_RUN_GITLEAKS: 'false', FAIL_GENERATE: '1' });
+    assert.equal(failed.status, 1);
+    assert.equal(fs.existsSync(sbom), false, 'stale and partial SBOM removed');
+    const upload = data.execute('upload', { DC_RUN_CODEQL: 'false', DC_RUN_GITLEAKS: 'false' });
+    assert.equal(upload.status, 0, upload.stderr);
+    assert.deepEqual(upload.calls.filter((call) => call[1] === 'sbom' && call[2] === 'upload'), []);
+    assert.match(upload.stdout, /No SBOM file found; skipping/);
+    fs.writeFileSync(sbom, 'stale again');
+    const ok = data.execute('start-scans', { DC_RUN_GITLEAKS: 'false' });
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.equal(fs.readFileSync(sbom, 'utf8'), '{}');
+  } finally { data.cleanup(); }
+});
+
+test('removes a stale SBOM even when an earlier scan fails before SBOM generation starts', () => {
+  const data = fixture();
+  try {
+    initializeGit(data.workspace);
+    fs.writeFileSync(path.join(data.root, 'bin', 'gitleaks'), `#!${process.execPath}\nprocess.exit(2);\n`, { mode: 0o755 });
+    const sbom = path.join(data.workspace, 'sbom.json');
+    fs.writeFileSync(sbom, 'committed SBOM');
+    const result = data.execute('start-scans');
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /gitleaks failed/);
+    assert.equal(fs.existsSync(sbom), false);
+    const upload = data.execute('upload', { DC_RUN_CODEQL: 'false', DC_RUN_GITLEAKS: 'false' });
+    assert.equal(upload.calls.filter((call) => call[1] === 'sbom' && call[2] === 'upload').length, 0);
+  } finally { data.cleanup(); }
+});
+
+test('removes a partial Gitleaks report when the scan times out', () => {
+  const data = fixture();
+  try {
+    initializeGit(data.workspace);
+    fs.writeFileSync(path.join(data.root, 'bin', 'gitleaks'), `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.argv[process.argv.indexOf('--report-path') + 1], 'partial');\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20000);\n`, { mode: 0o755 });
+    const result = data.execute('start-scans', { DC_RUN_SBOM: 'false', DC_INPUT_SCAN_TIMEOUT: '1' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /gitleaks did not finish within the scan-timeout of 1s/);
+    assert.equal(fs.existsSync(path.join(data.workspace, 'gitleaks.sarif')), false);
+  } finally { data.cleanup(); }
+});
+
+test('reports scans that did not finish and scans that failed, even when logs are missing', () => {
+  const data = fixture();
+  try {
+    const missing = data.execute('verify-scans', { DC_BG_WORK_DIR: data.root });
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /Gitleaks scan did not complete/);
+    assert.match(missing.stderr, /SBOM generate did not complete/);
+    fs.writeFileSync(path.join(data.root, 'gitleaks.exit'), '1\n');
+    fs.writeFileSync(path.join(data.root, 'sbom.exit'), '0\n');
+    const failed = data.execute('verify-scans', { DC_BG_WORK_DIR: data.root });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /Gitleaks scan failed/);
+    assert.doesNotMatch(failed.stderr, /SBOM generate/);
   } finally { data.cleanup(); }
 });
 
@@ -153,7 +220,7 @@ test('skips Gitleaks when SARIF is skipped or provided externally', () => {
       const start = data.execute('start-scans', overrides);
       assert.equal(start.status, 0, start.stderr);
       assert.deepEqual(start.calls.map((call) => call[0]), ['smctl']);
-      assert.equal(data.execute('wait-scans', { ...overrides, DC_BG_WORK_DIR: path.join(data.root, 'dc-bg-jobs'), DC_SCAN_TIMEOUT: '0' }).status, 0);
+      assert.equal(data.execute('verify-scans', { ...overrides, DC_BG_WORK_DIR: path.join(data.root, 'dc-bg-jobs') }).status, 0);
     } finally { data.cleanup(); }
   }
 });
@@ -165,20 +232,9 @@ test('does not generate SBOM when skipped or provided externally', () => {
       const start = data.execute('start-scans', { ...overrides, DC_RUN_GITLEAKS: 'false' });
       assert.equal(start.status, 0, start.stderr);
       assert.deepEqual(start.calls, []);
-      assert.equal(data.execute('wait-scans', { ...overrides, DC_RUN_GITLEAKS: 'false', DC_BG_WORK_DIR: path.join(data.root, 'dc-bg-jobs'), DC_SCAN_TIMEOUT: '0' }).status, 0);
+      assert.equal(data.execute('verify-scans', { ...overrides, DC_RUN_GITLEAKS: 'false', DC_BG_WORK_DIR: path.join(data.root, 'dc-bg-jobs') }).status, 0);
     } finally { data.cleanup(); }
   }
-});
-
-test('reports failed scan markers even when logs are missing', () => {
-  const data = fixture();
-  try {
-    fs.writeFileSync(path.join(data.root, 'gitleaks.exit'), '1\n');
-    fs.writeFileSync(path.join(data.root, 'sbom.exit'), '0\n');
-    const result = data.execute('wait-scans', { DC_BG_WORK_DIR: data.root });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /Gitleaks scan failed/);
-  } finally { data.cleanup(); }
 });
 
 test('continues uploads after a failure and reports failure', () => {
@@ -189,6 +245,48 @@ test('continues uploads after a failure and reports failure', () => {
     assert.equal(result.status, 1);
     assert.equal(result.calls.length, 3);
     assert.match(result.stderr, /One or more uploads failed/);
+  } finally { data.cleanup(); }
+});
+
+test('rebuilds archives from scratch so stale entries and stale archives are never uploaded', () => {
+  const data = fixture();
+  try {
+    const entries = (zip) => spawnSync('unzip', ['-Z1', path.join(data.workspace, zip)], { encoding: 'utf8' }).stdout.trim().split('\n');
+    for (const [zip, stale] of [['codeql.zip', 'old-java.sarif'], ['gitleaks.zip', 'old-gitleaks.sarif']]) {
+      fs.writeFileSync(path.join(data.root, stale), '{}');
+      assert.equal(spawnSync('zip', ['-q', '-j', path.join(data.workspace, zip), path.join(data.root, stale)]).status, 0);
+    }
+    fs.mkdirSync(data.env.DC_SARIF_OUTPUT);
+    fs.writeFileSync(path.join(data.env.DC_SARIF_OUTPUT, 'javascript.sarif'), '{}');
+    fs.writeFileSync(path.join(data.workspace, 'gitleaks.sarif'), '{}');
+    const packaged = data.execute('package-sarifs');
+    assert.equal(packaged.status, 0, packaged.stderr);
+    assert.deepEqual(entries('codeql.zip'), ['javascript.sarif']);
+    assert.deepEqual(entries('gitleaks.zip'), ['gitleaks.sarif']);
+    fs.rmSync(data.env.DC_SARIF_OUTPUT, { recursive: true });
+    fs.rmSync(path.join(data.workspace, 'gitleaks.sarif'));
+    const empty = data.execute('package-sarifs');
+    assert.equal(empty.status, 0, empty.stderr);
+    assert.equal(fs.existsSync(path.join(data.workspace, 'codeql.zip')), false);
+    assert.equal(fs.existsSync(path.join(data.workspace, 'gitleaks.zip')), false);
+    const upload = data.execute('upload', { DC_RUN_SBOM: 'false' });
+    assert.equal(upload.status, 0, upload.stderr);
+    assert.deepEqual(upload.calls, []);
+  } finally { data.cleanup(); }
+});
+
+test('removes stale CodeQL results before analysis', () => {
+  const data = fixture();
+  try {
+    fs.mkdirSync(data.env.DC_SARIF_OUTPUT);
+    fs.writeFileSync(path.join(data.env.DC_SARIF_OUTPUT, 'stale.sarif'), '{}');
+    const result = data.execute('resolve-languages', { DC_INPUT_LANGUAGES: 'java' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(data.env.DC_SARIF_OUTPUT), false);
+    fs.mkdirSync(data.env.DC_SARIF_OUTPUT);
+    const skipped = data.execute('resolve-languages', { DC_INPUT_LANGUAGES: 'java', DC_RUN_CODEQL: 'false' });
+    assert.equal(skipped.status, 0, skipped.stderr);
+    assert.equal(fs.existsSync(data.env.DC_SARIF_OUTPUT), true, 'untouched when CodeQL is not run');
   } finally { data.cleanup(); }
 });
 
@@ -232,6 +330,8 @@ test('uploads multiple external scanner files and SBOM alongside generated CodeQ
     ];
     for (const item of external) fs.writeFileSync(item.file, 'external');
     for (const file of ['codeql.zip', 'gitleaks.zip', 'sbom.json']) fs.writeFileSync(path.join(data.workspace, file), 'stale');
+    fs.mkdirSync(data.env.DC_SARIF_OUTPUT);
+    fs.writeFileSync(path.join(data.env.DC_SARIF_OUTPUT, 'java.sarif'), '{}');
     const settings = { DC_RUN_GITLEAKS: 'false', DC_RUN_SBOM: 'false', DC_EXTERNAL_ARTIFACTS: JSON.stringify(external) };
     const packaged = data.execute('package-sarifs', settings);
     assert.equal(packaged.status, 0, packaged.stderr);

@@ -103,7 +103,7 @@ inputs:
     default: "[]"
 
   use-github-caching-service:
-    description: "Cache downloaded tools (smctl, gitleaks) across runs. When false, tools download every run."
+    description: "Cache the downloaded smctl binary across runs. When false, smctl downloads every run. Gitleaks is always downloaded and verified fresh."
     required: false
     default: "true"
 
@@ -128,19 +128,26 @@ inputs:
     default: ""
 
   scan-timeout:
-    description: "Maximum seconds to wait for background scans (Gitleaks + SBOM generate) to complete. Increase for large repos or low-compute runners."
+    description: "Maximum seconds, as a whole number from 1 to 21600, for the Gitleaks scan and SBOM generation together; a scan that exceeds it is stopped and the action fails. Increase for large repos or low-compute runners."
     required: false
     default: "600"
 
 runs:
   using: "composite"
   steps:
+    # 0 -----------------------------------------------------------------------
+    - name: Select Node.js runtime
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+      run: bash "$ACTION_DIR/scripts/ensure-node.sh"
+
     # 1 -----------------------------------------------------------------------
     - name: Block unsafe pull_request_target trigger
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-      run: node "$ACTION_DIR/dist/index.js" guard-trigger
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" guard-trigger'
 
     # 2 -----------------------------------------------------------------------
     - name: Sanitize and normalize action inputs
@@ -166,14 +173,15 @@ runs:
         RAW_CACHE_VERSION: ${{ inputs.cache-version }}
         RAW_GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
         RAW_CODEQL_TOOLS_VERSION: ${{ inputs.codeql-tools-version }}
-      run: node "$ACTION_DIR/dist/index.js" normalize-inputs
+        RAW_SCAN_TIMEOUT: ${{ inputs.scan-timeout }}
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" normalize-inputs'
     # 3 -----------------------------------------------------------------------
     - name: Export smctl auth
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
         DC_INPUT_API_KEY: ${{ inputs.api-key }}
-      run: node "$ACTION_DIR/dist/index.js" export-auth
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" export-auth'
     # 4 -----------------------------------------------------------------------
     - name: Checkout repository
       uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
@@ -189,14 +197,14 @@ runs:
         ACTION_DIR: ${{ github.action_path }}
         DC_INPUT_COMMIT_SHA: ${{ inputs.commit-sha }}
         DC_INPUT_BRANCH: ${{ inputs.branch }}
-      run: node "$ACTION_DIR/dist/index.js" resolve-context
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" resolve-context'
     # 6 -----------------------------------------------------------------------
     - name: Compute tool cache keys
       id: cache_keys
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-      run: node "$ACTION_DIR/dist/index.js" cache-keys
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" cache-keys'
     - name: Restore smctl from cache
       id: smctl_cache
       if: ${{ inputs.use-github-caching-service == 'true' }}
@@ -205,29 +213,22 @@ runs:
         path: ${{ env.DC_SMCTL_TOOL_CACHE_ROOT }}
         key: ${{ env.SMCTL_CACHE_KEY }}
 
-    - name: Restore gitleaks from cache
-      id: gitleaks_cache
-      if: ${{ inputs.use-github-caching-service == 'true' && env.DC_RUN_GITLEAKS == 'true' }}
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-      with:
-        path: ${{ env.DC_GITLEAKS_TOOL_CACHE_ROOT }}
-        key: ${{ env.GITLEAKS_CACHE_KEY }}
 
     - name: Download and verify smctl
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-      run: node "$ACTION_DIR/dist/index.js" download-smctl
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" download-smctl'
     - name: Download and verify gitleaks
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-      run: node "$ACTION_DIR/dist/index.js" download-gitleaks
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" download-gitleaks'
     - name: Add tools to PATH
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-      run: node "$ACTION_DIR/dist/index.js" add-tools
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" add-tools'
     # 7 — Create release (blocking — scans need the Release ID) ----------------
     - name: Create release
       shell: bash
@@ -238,13 +239,13 @@ runs:
         DC_INPUT_RELEASE_NODE_ID: ${{ inputs.release-node-id }}
         DC_INPUT_RELEASED_AT: ${{ inputs.released-at }}
         DC_INPUT_SOURCE: ${{ inputs.source }}
-      run: node "$ACTION_DIR/dist/index.js" create-release
-    # 7b — Gitleaks + SBOM generate -------------------------------------------
-    - name: Start Gitleaks scan and SBOM generate (background)
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" create-release'
+    # 7b — Gitleaks + SBOM generate (sequential, bounded by scan-timeout) -----
+    - name: Run Gitleaks scan and SBOM generate
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-      run: node "$ACTION_DIR/dist/index.js" start-scans
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" start-scans'
     # 8 -----------------------------------------------------------------------
     - name: Resolve CodeQL languages
       shell: bash
@@ -252,7 +253,7 @@ runs:
         ACTION_DIR: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.github-token }}
         DC_INPUT_CODEQL_BUILD_MODE: ${{ inputs.codeql-build-mode }}
-      run: node "$ACTION_DIR/dist/index.js" resolve-languages
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" resolve-languages'
     - name: Initialize CodeQL
       if: ${{ env.DC_RUN_CODEQL == 'true' && env.DC_LANGUAGES != '' }}
       uses: github/codeql-action/init@411bbbe57033eedfc1a82d68c01345aa96c737d7 # v4
@@ -270,24 +271,23 @@ runs:
         upload-database: false
         output: ${{ env.DC_SARIF_OUTPUT }}
 
-    # 10b — Wait for background jobs (Gitleaks + SBOM) -----------------------
-    - name: Wait for Gitleaks and SBOM generate
+    # 10b — Show Gitleaks + SBOM results ------------------------------------
+    - name: Check Gitleaks and SBOM generate results
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-        DC_SCAN_TIMEOUT: ${{ inputs.scan-timeout }}
-      run: node "$ACTION_DIR/dist/index.js" wait-scans
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" verify-scans'
     # 10c — Package SARIFs ----------------------------------------------------
     - name: Package each SARIF independently
       if: ${{ always() && steps.normalize_inputs.outcome == 'success' }}
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-      run: node "$ACTION_DIR/dist/index.js" package-sarifs
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" package-sarifs'
     # 11 — Upload scans + SBOM ------------------------------------------------
     - name: Upload scans and SBOM (sequential)
       if: ${{ always() && steps.normalize_inputs.outcome == 'success' }}
       shell: bash
       env:
         ACTION_DIR: ${{ github.action_path }}
-      run: node "$ACTION_DIR/dist/index.js" upload
+      run: '"$DC_NODE" "$ACTION_DIR/dist/index.js" upload'

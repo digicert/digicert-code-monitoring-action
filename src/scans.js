@@ -10,6 +10,9 @@ function runLogged(command, args, log, options = {}) {
   let result;
   try {
     result = run(command, args, { ...options, allowFailure: true, stdio: ['ignore', descriptor, descriptor] });
+  } catch (error) {
+    if (error.code === 'ETIMEDOUT') throw new Error(`${command} did not finish within the scan-timeout of ${process.env.DC_INPUT_SCAN_TIMEOUT || '600'}s.`);
+    throw error;
   } finally {
     fs.closeSync(descriptor);
   }
@@ -24,7 +27,7 @@ function scanJobs(env) {
   return jobs;
 }
 
-function runGitleaks(env, work) {
+function runGitleaks(env, work, limits) {
   const gitleaksLog = child(work, 'gitleaks.log');
   fs.writeFileSync(gitleaksLog, '');
   const report = child(env.GITHUB_WORKSPACE, env.DC_GITLEAKS_SARIF_OUTPUT);
@@ -33,15 +36,16 @@ function runGitleaks(env, work) {
   // Remove any stale report so only this run's output is uploaded.
   fs.rmSync(report, { force: true });
   try {
-    runLogged('git', ['archive', '--output', archive, 'HEAD'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE, env: { ...env, GIT_LFS_SKIP_SMUDGE: '1' } });
-    runLogged('tar', ['-xf', archive, '-C', scanDir], gitleaksLog);
-    runLogged('gitleaks', ['detect', '--source', scanDir, '--report-format', 'sarif', '--report-path', report, '--exit-code', '0', '--no-banner', '--redact', '--no-git'], gitleaksLog, { cwd: env.GITHUB_WORKSPACE });
+    runLogged('git', ['archive', '--output', archive, 'HEAD'], gitleaksLog, { ...limits(), cwd: env.GITHUB_WORKSPACE, env: { ...env, GIT_LFS_SKIP_SMUDGE: '1' } });
+    runLogged('tar', ['-xf', archive, '-C', scanDir], gitleaksLog, limits());
+    runLogged('gitleaks', ['detect', '--source', scanDir, '--report-format', 'sarif', '--report-path', report, '--exit-code', '0', '--no-banner', '--redact', '--no-git'], gitleaksLog, { ...limits(), cwd: env.GITHUB_WORKSPACE });
     if (!fs.existsSync(report)) throw new Error('Gitleaks did not produce a SARIF report.');
     let findings = 0;
     try { findings = JSON.parse(fs.readFileSync(report, 'utf8')).runs[0].results.length; } catch { findings = 0; }
     fs.appendFileSync(gitleaksLog, `Gitleaks findings: ${findings}\n`);
   } catch (error) {
     fs.appendFileSync(gitleaksLog, `${error.message}\n`);
+    fs.rmSync(report, { force: true });
     throw error;
   } finally {
     fs.rmSync(scanDir, { recursive: true, force: true });
@@ -55,11 +59,23 @@ function startScans() {
   const work = child(env.RUNNER_TEMP, 'dc-bg-jobs');
   fs.mkdirSync(work, { recursive: true });
   exportEnv('DC_BG_WORK_DIR', work);
-  if (env.DC_RUN_GITLEAKS === 'true') runGitleaks(env, work);
+  // One shared budget for every scan, so a hung scanner cannot outlive scan-timeout.
+  const deadline = Date.now() + Number(env.DC_INPUT_SCAN_TIMEOUT || '600') * 1000;
+  const limits = () => ({ timeout: Math.max(1000, deadline - Date.now()), killSignal: 'SIGKILL' });
+  // Remove a stale SBOM up front so a failure in an earlier scan cannot leave an old file to upload.
+  const sbom = child(env.GITHUB_WORKSPACE, env.DC_SBOM_OUTPUT);
+  if (env.DC_RUN_SBOM === 'true') fs.rmSync(sbom, { force: true });
+  if (env.DC_RUN_GITLEAKS === 'true') runGitleaks(env, work, limits);
   if (env.DC_RUN_SBOM === 'true') {
     const sbomLog = child(work, 'sbom.log');
     fs.writeFileSync(sbomLog, '');
-    runLogged('smctl', ['sbom', 'generate', '--path', '.', '--output', env.DC_SBOM_OUTPUT, '--spec-version', env.DC_INPUT_SBOM_SPEC], sbomLog, { cwd: env.GITHUB_WORKSPACE });
+    try {
+      runLogged('smctl', ['sbom', 'generate', '--path', '.', '--output', env.DC_SBOM_OUTPUT, '--spec-version', env.DC_INPUT_SBOM_SPEC], sbomLog, { ...limits(), cwd: env.GITHUB_WORKSPACE });
+    } catch (error) {
+      fs.appendFileSync(sbomLog, `${error.message}\n`);
+      fs.rmSync(sbom, { force: true });
+      throw error;
+    }
     fs.writeFileSync(child(work, 'sbom.exit'), '0\n');
   }
   console.log('Requested scans and SBOM generation completed.');
@@ -68,6 +84,8 @@ function startScans() {
 function resolveLanguages() {
   const env = process.env;
   if (env.DC_RUN_CODEQL !== 'true') return;
+  // Drop results from an earlier run so stale per-language SARIF files are never packaged.
+  if (env.DC_SARIF_OUTPUT) fs.rmSync(env.DC_SARIF_OUTPUT, { recursive: true, force: true });
   const priority = xargs((env.DC_INPUT_CODEQL_BUILD_MODE || 'none').toLowerCase());
   if (!['none', 'autobuild'].includes(priority)) throw new Error(`Invalid codeql-build-mode: '${priority}' (use none or autobuild).`);
   let languages = env.DC_INPUT_LANGUAGES || '';
@@ -99,24 +117,20 @@ function resolveLanguages() {
   console.log(`CodeQL build-mode: ${mode}; scanning: ${output || '<none matching this mode>'}`);
 }
 
-async function waitScans() {
+function verifyScans() {
   const work = process.env.DC_BG_WORK_DIR;
-  const jobs = scanJobs(process.env);
-  const timeout = Number(process.env.DC_SCAN_TIMEOUT || '600');
-  if (!Number.isInteger(timeout)) throw new Error('Invalid scan-timeout.');
-  let elapsed = 0;
-  while (jobs.some((name) => !fs.existsSync(child(work, `${name}.exit`)))) {
-    if (elapsed >= timeout) throw new Error(`Timeout: background jobs did not finish within ${timeout}s.`);
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-    elapsed += 5;
-  }
   let failed = false;
-  for (const name of jobs) {
+  for (const name of scanJobs(process.env)) {
+    const label = name === 'sbom' ? 'SBOM generate' : 'Gitleaks scan';
     console.log(`----- ${name === 'sbom' ? 'sbom generate' : name} -----`);
     const log = child(work, `${name}.log`);
     if (fs.existsSync(log)) process.stdout.write(fs.readFileSync(log, 'utf8'));
-    if (fs.readFileSync(child(work, `${name}.exit`), 'utf8').trim() !== '0') {
-      console.error(`${name === 'sbom' ? 'SBOM generate' : 'Gitleaks scan'} failed.`);
+    const marker = child(work, `${name}.exit`);
+    if (!fs.existsSync(marker)) {
+      console.error(`${label} did not complete.`);
+      failed = true;
+    } else if (fs.readFileSync(marker, 'utf8').trim() !== '0') {
+      console.error(`${label} failed.`);
       failed = true;
     }
   }
@@ -145,6 +159,8 @@ function externalFile(file, label) {
 function packageSarifs() {
   const env = process.env;
   if (env.DC_RUN_CODEQL === 'true') {
+    // zip -j adds to an existing archive, so start from nothing to avoid stale entries.
+    fs.rmSync(env.DC_CODEQL_SCAN_ZIP, { force: true });
     const codeql = env.DC_SARIF_OUTPUT;
     const files = fs.existsSync(codeql) ? (fs.statSync(codeql).isDirectory() ? sarifFiles(codeql) : [codeql]) : [];
     if (files.length) {
@@ -153,6 +169,7 @@ function packageSarifs() {
     } else console.error(`CodeQL SARIF (${codeql}) not found or empty; skipping CodeQL scan upload.`);
   }
   if (env.DC_RUN_GITLEAKS === 'true') {
+    fs.rmSync(env.DC_GITLEAKS_SCAN_ZIP, { force: true });
     if (fs.existsSync(env.DC_GITLEAKS_SARIF_OUTPUT)) {
       const result = run('zip', ['-j', env.DC_GITLEAKS_SCAN_ZIP, env.DC_GITLEAKS_SARIF_OUTPUT]);
       process.stdout.write(result.stdout || '');
@@ -214,4 +231,4 @@ function upload() {
   try { uploadAll(process.env); } finally { removeExternal(process.env); }
 }
 
-module.exports = { startScans, resolveLanguages, waitScans, packageSarifs, upload };
+module.exports = { startScans, resolveLanguages, verifyScans, packageSarifs, upload };

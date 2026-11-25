@@ -158,6 +158,42 @@ test('downloads and verifies the Gitleaks archive', () => {
   } finally { data.cleanup(); }
 });
 
+test('always installs a fresh Gitleaks, replacing any binary that is already there', () => {
+  const data = fixture();
+  try {
+    const source = path.join(data.directory, 'source');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, 'gitleaks'), 'fresh binary');
+    const archive = path.join(data.directory, 'archive.tar.gz');
+    assert.equal(spawnSync('tar', ['-czf', archive, '-C', source, 'gitleaks']).status, 0);
+    const digest = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+    const checksumFile = path.join(data.directory, 'checksums.txt');
+    fs.writeFileSync(checksumFile, `${digest}  gitleaks_8.18.4_linux_x64.tar.gz\n`);
+    const bin = path.join(data.directory, 'gitleaks-bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'gitleaks'), 'poisoned binary', { mode: 0o755 });
+    const result = data.execute('download-gitleaks', { DC_RUN_GITLEAKS: 'true', DC_GITLEAKS_BIN_DIR: bin, DC_GITLEAKS_VERSION: '8.18.4', DOWNLOAD_SOURCE: archive, DOWNLOAD_CHECKSUM: checksumFile });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.calls.filter((call) => call[0] === 'curl').length, 2, 'archive and checksums were downloaded');
+    assert.equal(fs.readFileSync(path.join(bin, 'gitleaks'), 'utf8'), 'fresh binary');
+    fs.writeFileSync(checksumFile, `${'0'.repeat(64)}  gitleaks_8.18.4_linux_x64.tar.gz\n`);
+    fs.writeFileSync(path.join(bin, 'gitleaks'), 'poisoned binary', { mode: 0o755 });
+    const mismatch = data.execute('download-gitleaks', { DC_RUN_GITLEAKS: 'true', DC_GITLEAKS_BIN_DIR: bin, DC_GITLEAKS_VERSION: '8.18.4', DOWNLOAD_SOURCE: archive, DOWNLOAD_CHECKSUM: checksumFile });
+    assert.notEqual(mismatch.status, 0);
+  } finally { data.cleanup(); }
+});
+
+test('keeps Gitleaks out of the cache and installs it under the per-job temp directory', () => {
+  const data = fixture();
+  try {
+    const result = data.execute('cache-keys', { RUNNER_TOOL_CACHE: '/tool-cache', RUNNER_TEMP: '/job-temp', DC_INPUT_USE_CHECKSUM: 'false', DC_INPUT_CACHE_VERSION: '0.0.0-0', DC_GITLEAKS_VERSION: '8.18.4' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.exported, /DC_GITLEAKS_BIN_DIR<<[^\n]+\n\/job-temp\/dc-gitleaks\/8\.18\.4\/x64\n/);
+    assert.doesNotMatch(result.exported, /GITLEAKS_CACHE_KEY|GITLEAKS_TOOL_CACHE_ROOT/);
+    assert.match(result.exported, /SMCTL_CACHE_KEY/);
+  } finally { data.cleanup(); }
+});
+
 test('reuses release ID without calling external commands', () => {
   const data = fixture();
   try {

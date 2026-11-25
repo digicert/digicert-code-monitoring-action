@@ -23,14 +23,14 @@ const steps = {
   'create-release': release.createRelease,
   'start-scans': scans.startScans,
   'resolve-languages': scans.resolveLanguages,
-  'wait-scans': scans.waitScans,
+  'verify-scans': scans.verifyScans,
   'package-sarifs': scans.packageSarifs,
   'upload': scans.upload,
 };
 
 async function main() {
-  if (Number(process.versions.node.split('.')[0]) < 24) {
-    throw new Error('Node.js 24 or newer is required on the runner.');
+  if (Number(process.versions.node.split('.')[0]) < 20) {
+    throw new Error('Node.js 20 or newer is required.');
   }
   const step = process.argv[2];
   if (!Object.hasOwn(steps, step)) {

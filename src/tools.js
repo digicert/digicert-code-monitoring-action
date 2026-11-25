@@ -48,12 +48,10 @@ async function cacheKeys() {
   }
   const values = {
     DC_SMCTL_BIN_DIR: `${cache}/smctl/${version}/x64`,
-    DC_GITLEAKS_BIN_DIR: `${cache}/gitleaks/${env.DC_GITLEAKS_VERSION}/x64`,
+    DC_GITLEAKS_BIN_DIR: `${env.RUNNER_TEMP || '/tmp'}/dc-gitleaks/${env.DC_GITLEAKS_VERSION}/x64`,
     DC_SMCTL_TOOL_CACHE_ROOT: `${cache}/smctl`,
-    DC_GITLEAKS_TOOL_CACHE_ROOT: `${cache}/gitleaks`,
     DC_SMCTL_SHA256: sha,
     SMCTL_CACHE_KEY: `smctl-${version}-linux-x64`,
-    GITLEAKS_CACHE_KEY: `gitleaks-${env.DC_GITLEAKS_VERSION}-linux-x64`,
   };
   for (const [name, value] of Object.entries(values)) exportEnv(name, value);
 }
@@ -90,7 +88,7 @@ function downloadGitleaks() {
   const env = process.env;
   if (env.DC_RUN_GITLEAKS !== 'true') return;
   const file = path.join(env.DC_GITLEAKS_BIN_DIR, 'gitleaks');
-  if (executable(file)) return console.log(`gitleaks ${env.DC_GITLEAKS_VERSION} found in tool cache @ ${env.DC_GITLEAKS_BIN_DIR}`);
+  // Always download and verify: the install directory is per job and never reused from a cache.
   const version = env.DC_GITLEAKS_VERSION;
   const tarball = `gitleaks_${version}_linux_x64.tar.gz`;
   const base = `https://github.com/gitleaks/gitleaks/releases/download/v${version}`;
@@ -104,6 +102,7 @@ function downloadGitleaks() {
     run('tar', ['-xzf', tarball], { cwd: temp });
     fs.chmodSync(path.join(temp, 'gitleaks'), 0o755);
     fs.mkdirSync(env.DC_GITLEAKS_BIN_DIR, { recursive: true });
+    fs.rmSync(file, { force: true });
     fs.copyFileSync(path.join(temp, 'gitleaks'), file);
     fs.chmodSync(file, 0o755);
   } finally {

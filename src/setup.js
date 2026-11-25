@@ -20,7 +20,14 @@ function toolInputs(env) {
   const cacheVersion = safeToken(env.RAW_CACHE_VERSION || '0.0.0-0', /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'Invalid cache-version: use 1-64 characters from [A-Za-z0-9._-], starting with an alphanumeric.');
   const gitleaksVersion = safeToken(env.RAW_GITLEAKS_VERSION || '8.18.4', /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/, 'Invalid gitleaks-version: use a plain X.Y.Z release version (e.g. 8.18.4).');
   const codeqlTools = env.RAW_CODEQL_TOOLS_VERSION ? safeToken(env.RAW_CODEQL_TOOLS_VERSION, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'Invalid codeql-tools-version: use a version such as 2.17.6 (1-64 characters from [A-Za-z0-9._-]).') : '';
-  return { useChecksum, cacheVersion, gitleaksVersion, codeqlTools };
+  return { useChecksum, cacheVersion, gitleaksVersion, codeqlTools, scanTimeout: scanTimeoutInput(env) };
+}
+
+// Seconds; capped at GitHub's maximum job duration so the value is always a sane time limit.
+function scanTimeoutInput(env) {
+  const value = (env.RAW_SCAN_TIMEOUT || '600').trim();
+  if (!/^[1-9][0-9]{0,4}$/.test(value) || Number(value) > 21600) throw new Error('Invalid scan-timeout: use a whole number of seconds from 1 to 21600.');
+  return value;
 }
 
 function artifactInputs(env) {
@@ -77,6 +84,7 @@ async function normalizeInputs() {
   exportEnv('DC_INPUT_CACHE_VERSION', tools.cacheVersion);
   exportEnv('DC_GITLEAKS_VERSION', tools.gitleaksVersion);
   exportEnv('DC_CODEQL_TOOLS_VERSION', tools.codeqlTools);
+  exportEnv('DC_INPUT_SCAN_TIMEOUT', tools.scanTimeout);
   for (const [field] of fields) exportEnv(`DC_INPUT_${field}`, env[`RAW_${field}`] || '');
   exportEnv('DC_INPUT_LANGUAGES', languages);
   exportEnv('DC_SKIP_SBOM', skipSbom);

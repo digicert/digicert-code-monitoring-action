@@ -83,6 +83,23 @@ test('validates and exports tool inputs used in URLs, cache keys and paths', () 
   }
 });
 
+test('validates scan-timeout before any scan runs', () => {
+  const base = { RAW_HOST: 'https://example.com', RAW_CDN: 'https://cdn.example', RAW_API_KEY: 'secret' };
+  const exported = (output) => /DC_INPUT_SCAN_TIMEOUT<<[^\n]+\n(\d+)\n/.exec(output)?.[1];
+  assert.equal(exported(execute('normalize-inputs', base).output), '600');
+  for (const [raw, expected] of [['1', '1'], ['600', '600'], [' 90 ', '90'], ['21600', '21600']]) {
+    const result = execute('normalize-inputs', { ...base, RAW_SCAN_TIMEOUT: raw });
+    assert.equal(result.status, 0, `${raw}: ${result.stderr}`);
+    assert.equal(exported(result.output), expected, raw);
+  }
+  for (const raw of ['0', '-1', '-600', 'abc', '1.5', '1e3', '0x10', '21601', '99999', '007', '5\n6']) {
+    const result = execute('normalize-inputs', { ...base, RAW_SCAN_TIMEOUT: raw });
+    assert.equal(result.status, 1, JSON.stringify(raw));
+    assert.match(result.stderr, /Invalid scan-timeout/, JSON.stringify(raw));
+    assert.equal(result.output, '', JSON.stringify(raw));
+  }
+});
+
 test('computes run flags from skip settings', () => {
   const base = { RAW_HOST: 'https://example.com', RAW_CDN: 'https://cdn.example', RAW_API_KEY: 'secret' };
   const flags = (output) => Object.fromEntries(['CODEQL', 'GITLEAKS', 'SBOM'].map((name) => [name, new RegExp(`DC_RUN_${name}<<[^\\n]+\\n(\\w+)\\n`).exec(output)[1]]));
